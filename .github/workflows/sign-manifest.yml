@@ -1,0 +1,27 @@
+name: sign-manifest
+# Re-sign a release's manifest.json with the repo secret (used when models change). Manual only.
+on:
+  workflow_dispatch:
+    inputs:
+      tag: { description: "Release tag, e.g. models-2026-10", required: true }
+permissions: { contents: write }
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install cryptography
+      - env: { GH_TOKEN: "${{ github.token }}", TAG: "${{ inputs.tag }}" }
+        run: gh release download "$TAG" -p manifest.json -D rel
+      - env: { AARIA_MODELS_SIGNING_KEY: "${{ secrets.AARIA_MODELS_SIGNING_KEY }}" }
+        run: |
+          python - <<'PY'
+          import os
+          from cryptography.hazmat.primitives import hashes, serialization
+          from cryptography.hazmat.primitives.asymmetric import ec
+          k = serialization.load_pem_private_key(os.environ["AARIA_MODELS_SIGNING_KEY"].encode(), password=None)
+          d = open("rel/manifest.json","rb").read()
+          open("rel/manifest.json.sig","wb").write(k.sign(d, ec.ECDSA(hashes.SHA256())))
+          PY
+      - env: { GH_TOKEN: "${{ github.token }}", TAG: "${{ inputs.tag }}" }
+        run: gh release upload "$TAG" rel/manifest.json.sig --clobber
