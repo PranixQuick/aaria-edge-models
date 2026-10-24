@@ -1,0 +1,23 @@
+{
+  "files": [
+    {
+      "bytes": 137563742,
+      "name": "model.int8.onnx",
+      "sha256": "13774a654ce5152796e1129db880a721f7c1ec4cd6301e627e258336ec9ac49e",
+      "url": "https://github.com/PranixQuick/aaria-edge-models/releases/download/models-2026-10/te__model.int8.onnx"
+    },
+    {
+      "bytes": 71,
+      "name": "model.json",
+      "sha256": "5e42ed018bdf7894ba3f04493b8fcdba85ecce3276349f5893624b2e53a8bf8c",
+      "url": "https://github.com/PranixQuick/aaria-edge-models/releases/download/models-2026-10/te__model.json"
+    },
+    {
+      "bytes": 2963,
+      "name": "tokens.txt",
+      "sha256": "02488cdcc1e893b392b1ba24f47508e7b7c64b117be249a0d09c5d8b65ecdfcb",
+      "url": "https://github.com/PranixQuick/aaria-edge-models/releases/download/models-2026-10/te__tokens.txt"
+    }
+  ],
+  "type": "ctc"
+}
