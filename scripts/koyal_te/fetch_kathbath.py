@@ -153,6 +153,8 @@ def main():
     with open(args.manifest, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
     print(f"Successfully fetched {len(rows)} clips to {args.out_dir}; manifest written to {args.manifest}")
     print(f"Skipped clips: {skipped_count}")
@@ -163,9 +165,23 @@ def main():
             f"::error::Collected {len(rows)} clips, which does not meet requirement of exactly {args.count} clips (skipped {skipped_count}).",
             file=sys.stderr,
         )
-        sys.exit(f"Fetched {len(rows)} clips, but must be exactly {args.count} clips.")
+        print(f"Fetched {len(rows)} clips, but must be exactly {args.count} clips.", file=sys.stderr)
+        return 1
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main() or 0)
+    # In run 40117993222 (24 Oct 17:51 UTC), fetch_kathbath.py passed and wrote 60 clips,
+    # but Python crashed during interpreter shutdown with:
+    #   Fatal Python error: PyGILState_Release: thread state ... must be current when releasing
+    #   Python runtime state: finalizing -> exit code 134
+    # This was caused by the Hugging Face `datasets` streaming background thread dying during
+    # interpreter finalization. Avoid running interpreter shutdown clean-up by exiting
+    # immediately via os._exit after explicitly flushing standard output and error streams.
+    try:
+        code = main() or 0
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else (1 if exc.code else 0)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)

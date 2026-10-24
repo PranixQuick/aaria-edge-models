@@ -50,6 +50,15 @@ def test_all_scripts_compile():
     print(f"  -> all {len(py_files)} scripts compiled successfully!")
 
 
+def test_fetch_kathbath_import():
+    print("Testing that fetch_kathbath can be imported as a module without exiting...")
+    import fetch_kathbath
+    assert hasattr(fetch_kathbath, "main"), "fetch_kathbath must define main"
+    assert hasattr(fetch_kathbath, "to_16k_mono_file"), "fetch_kathbath must define to_16k_mono_file"
+    assert fetch_kathbath.DEFAULT_COUNT == 60, "fetch_kathbath DEFAULT_COUNT must be 60"
+    print("  -> fetch_kathbath imported cleanly as a module!")
+
+
 def test_normalise():
     print("Testing normalise.py...")
     # Basic normalization & number composition
@@ -294,6 +303,7 @@ def test_license_content():
 
 if __name__ == "__main__":
     test_all_scripts_compile()
+    test_fetch_kathbath_import()
     test_normalise()
     test_corpus_wer_vs_mean_gate()
     test_gate_logic()
