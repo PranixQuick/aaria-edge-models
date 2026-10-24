@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Download Koyal te-120M model assets from Hugging Face.
+Download Koyal te-120M model assets from Hugging Face using snapshot_download.
 
 Hard rules:
 - Hugging Face token comes only from HF_TOKEN.
 - If HF_TOKEN is missing: stops with 'HF_TOKEN secret missing'. Never prints or logs the token.
 - Gated access: prints clear explanation if access terms have not yet been accepted on Hugging Face.
+- Do not guess the file name: snapshot_download with allow_patterns=["*.nemo", "README.md", "*.md", "LICENSE*"],
+  finds the single .nemo file (halts if zero or >1), and exports NEMO_MODEL_PATH to $GITHUB_ENV.
 """
 
 import argparse
@@ -14,10 +16,7 @@ import sys
 from pathlib import Path
 
 MODEL_REPO = "adalat-ai/koyal-te-120m-1.0"
-FILES_TO_DOWNLOAD = [
-    "koyal-te-120m-1.0.nemo",
-    "README.md",
-]
+ALLOW_PATTERNS = ["*.nemo", "README.md", "*.md", "LICENSE*"]
 
 
 def token_from_env():
@@ -48,39 +47,59 @@ def main():
         sys.exit("HF_TOKEN secret missing")
 
     try:
-        from huggingface_hub import hf_hub_download
+        from huggingface_hub import snapshot_download
     except ImportError:
         sys.exit("huggingface_hub is required: pip install huggingface-hub")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading {args.repo} assets to {args.out_dir}...")
+    print(f"Downloading snapshot for {args.repo} into {args.out_dir}...")
+    print(f"Filter patterns: {ALLOW_PATTERNS}")
 
-    total_bytes = 0
-    for filename in FILES_TO_DOWNLOAD:
-        print(f"Fetching {filename} from {args.repo}...")
-        try:
-            downloaded_path = hf_hub_download(
-                repo_id=args.repo,
-                filename=filename,
-                token=token,
-                local_dir=str(args.out_dir),
+    try:
+        snapshot_download(
+            repo_id=args.repo,
+            allow_patterns=ALLOW_PATTERNS,
+            token=token,
+            local_dir=str(args.out_dir),
+        )
+    except Exception as e:
+        msg = str(e)
+        if any(term in msg.lower() for term in ("gated", "401", "403", "restricted", "access to model")):
+            print(f"::error::Gated model access error: {msg[:300]}", file=sys.stderr)
+            print(
+                f"Model {args.repo} is GATED. Please accept its terms once at "
+                f"https://huggingface.co/{args.repo} with the account behind HF_TOKEN, then re-run.",
+                file=sys.stderr,
             )
-            file_size = Path(downloaded_path).stat().st_size
-            total_bytes += file_size
-            print(f"  -> {filename}: {format_size(file_size)}")
-        except Exception as e:
-            msg = str(e)
-            if any(term in msg.lower() for term in ("gated", "401", "403", "restricted", "access to model")):
-                print(f"::error::Gated model access error: {msg[:300]}", file=sys.stderr)
-                print(
-                    f"Model {args.repo} is GATED. Please accept its terms once at "
-                    f"https://huggingface.co/{args.repo} with the account behind HF_TOKEN, then re-run.",
-                    file=sys.stderr,
-                )
-            else:
-                print(f"::error::Failed to download {filename}: {msg[:300]}", file=sys.stderr)
-            sys.exit(1)
+        else:
+            print(f"::error::Failed to download model snapshot: {msg[:300]}", file=sys.stderr)
+        sys.exit(1)
 
+    # Find the single .nemo file in the downloaded snapshot
+    nemo_files = sorted(list(args.out_dir.rglob("*.nemo")))
+    if len(nemo_files) == 0:
+        print(f"::error::No .nemo checkpoint file found in snapshot of {args.repo}", file=sys.stderr)
+        sys.exit(f"Error: No .nemo file found in repository snapshot at {args.out_dir}")
+    if len(nemo_files) > 1:
+        nemo_names = [f.name for f in nemo_files]
+        print(f"::error::Expected exactly one .nemo file, but found {len(nemo_files)}: {nemo_names}", file=sys.stderr)
+        sys.exit(f"Error: Found multiple ({len(nemo_files)}) .nemo files in snapshot: {nemo_names}")
+
+    found_nemo = nemo_files[0]
+    file_size = found_nemo.stat().st_size
+    print(f"Discovered single .nemo file: {found_nemo.name} ({format_size(file_size)})")
+
+    # Pass found path to subsequent workflow steps via GITHUB_ENV
+    github_env = os.environ.get("GITHUB_ENV")
+    if github_env:
+        with open(github_env, "a", encoding="utf-8") as f:
+            f.write(f"NEMO_MODEL_PATH={found_nemo.resolve()}\n")
+        print(f"Exported NEMO_MODEL_PATH={found_nemo.resolve()} to GITHUB_ENV")
+    else:
+        print(f"GITHUB_ENV not set; NEMO_MODEL_PATH is {found_nemo.resolve()}")
+
+    # Compute total downloaded size
+    total_bytes = sum(f.stat().st_size for f in args.out_dir.rglob("*") if f.is_file())
     print(f"[BANDWIDTH] Model download completed: {format_size(total_bytes)} ({total_bytes} bytes)")
     return 0
 

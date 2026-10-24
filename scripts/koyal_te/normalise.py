@@ -316,7 +316,36 @@ def cer(reference: str, hypothesis: str) -> float:
     return _levenshtein(r, h) / len(r)
 
 
+def compute_edits_and_lengths(reference: str, hypothesis: str) -> dict:
+    """
+    Compute word edits, reference word count, character edits, reference character count
+    on normalised text, along with per-clip error rates.
+    """
+    r_words = normalise(reference).split()
+    h_words = normalise(hypothesis).split()
+    w_edits = _levenshtein(r_words, h_words)
+    w_len = len(r_words)
+
+    r_chars = normalise(reference).replace(" ", "")
+    h_chars = normalise(hypothesis).replace(" ", "")
+    c_edits = _levenshtein(r_chars, h_chars)
+    c_len = len(r_chars)
+
+    w_err = (w_edits / w_len) if w_len > 0 else (0.0 if not h_words else 1.0)
+    c_err = (c_edits / c_len) if c_len > 0 else (0.0 if not h_chars else 1.0)
+
+    return {
+        "word_edits": w_edits,
+        "ref_words": w_len,
+        "clip_wer": w_err,
+        "char_edits": c_edits,
+        "ref_chars": c_len,
+        "clip_cer": c_err,
+    }
+
+
 if __name__ == "__main__":
+
     # Cases that must score ZERO: identical content, different formatting.
     same = [
         ("Remind me to pay the electricity bill tomorrow at 10 a.m.",

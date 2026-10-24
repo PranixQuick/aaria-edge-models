@@ -6,23 +6,47 @@ Compares:
 (a) Original .nemo checkpoint (koyal-te-120m-1.0)
 (b) Quantized ONNX model (model.int8.onnx) run via sherpa_onnx.OfflineRecognizer (v1.13.8)
 
-Both evaluated using identical text normalisation and WER / CER scoring.
+Both evaluated using identical text normalisation and Levenshtein edit distance scoring.
+Corpus-level metrics (total edits / total reference units over all 60 clips) serve as
+the definitive evaluation figures, with per-clip mean values preserved as additional columns.
+
 Measures inference latency for (b) on runner CPU (median and 95th-percentile seconds per clip).
-Enforces gate: FAIL the job if (b)'s WER is > 1.0 point worse than (a)'s.
+Enforces gate: FAIL the job if (b)'s corpus-level WER is > 1.0 percentage point worse than (a)'s.
+
+Captures installed environment versions matching nemo|torch|onnx|sherpa|lightning into
+the execution log and accuracy_results.json.
 """
 
 import argparse
 import json
 import math
 import os
+import re
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 # Add script directory to sys.path for normalise import
 sys.path.insert(0, str(Path(__file__).parent))
-from normalise import cer, normalise, wer
+from normalise import cer, compute_edits_and_lengths, normalise, wer
+
+
+def get_installed_versions():
+    """Extract installed packages matching nemo|torch|onnx|sherpa|lightning."""
+    try:
+        freeze_out = subprocess.check_output(
+            [sys.executable, "-m", "pip", "freeze"], text=True
+        )
+        matches = [
+            line.strip()
+            for line in freeze_out.splitlines()
+            if re.search(r"nemo|torch|onnx|sherpa|lightning", line, re.IGNORECASE)
+        ]
+        return matches
+    except Exception as e:
+        return [f"error reading pip freeze: {e}"]
 
 
 def to_16k_mono_file(src_path: Path, dst_path: Path):
@@ -93,6 +117,13 @@ def main():
     entries = [json.loads(line) for line in args.manifest.read_text(encoding="utf-8").splitlines() if line.strip()]
     print(f"Loaded {len(entries)} evaluation clips from {args.manifest}")
 
+    # Log installed dependency versions
+    installed_versions = get_installed_versions()
+    print("\n=== INSTALLED DEPENDENCY VERSIONS (pip freeze | grep -iE 'nemo|torch|onnx|sherpa|lightning') ===")
+    for v in installed_versions:
+        print(f"  {v}")
+    print("=========================================================================================\n")
+
     # 1. Load original NeMo model (a)
     print("Loading original NeMo model...")
     import nemo.collections.asr as nemo_asr
@@ -122,30 +153,49 @@ def main():
 
         # Transcribe with (a) NeMo
         hyp_a = transcribe_nemo(nemo_model, audio_file)
-        wer_a = wer(ref_text, hyp_a)
-        cer_a = cer(ref_text, hyp_a)
+        edits_a = compute_edits_and_lengths(ref_text, hyp_a)
 
         # Transcribe with (b) sherpa-onnx
         hyp_b, sec_b = transcribe_sherpa_onnx(recognizer, audio_file)
-        wer_b = wer(ref_text, hyp_b)
-        cer_b = cer(ref_text, hyp_b)
+        edits_b = compute_edits_and_lengths(ref_text, hyp_b)
         latencies_b.append(sec_b)
 
         results.append({
             "audio": item["audio"],
             "reference": ref_text,
             "hyp_a_nemo": hyp_a,
-            "wer_a": wer_a,
-            "cer_a": cer_a,
+            "wer_a": edits_a["clip_wer"],
+            "cer_a": edits_a["clip_cer"],
+            "edits_a": edits_a,
             "hyp_b_onnx": hyp_b,
-            "wer_b": wer_b,
-            "cer_b": cer_b,
+            "wer_b": edits_b["clip_wer"],
+            "cer_b": edits_b["clip_cer"],
+            "edits_b": edits_b,
             "latency_b_sec": sec_b,
         })
         if idx % 10 == 0 or idx == len(entries):
-            print(f"[{idx:02d}/{len(entries)}] a: wer={wer_a:.2f} cer={cer_a:.2f} | b: wer={wer_b:.2f} cer={cer_b:.2f} ({sec_b:.2f}s)")
+            print(
+                f"[{idx:02d}/{len(entries)}] a: wer={edits_a['clip_wer']:.2f} cer={edits_a['clip_cer']:.2f} | "
+                f"b: wer={edits_b['clip_wer']:.2f} cer={edits_b['clip_cer']:.2f} ({sec_b:.2f}s)"
+            )
 
-    # Aggregate statistics
+    # 3. Corpus-level calculations (total edits / total reference words or characters over all clips)
+    total_ref_words = sum(r["edits_a"]["ref_words"] for r in results)
+    total_ref_chars = sum(r["edits_a"]["ref_chars"] for r in results)
+
+    total_word_edits_a = sum(r["edits_a"]["word_edits"] for r in results)
+    total_char_edits_a = sum(r["edits_a"]["char_edits"] for r in results)
+
+    total_word_edits_b = sum(r["edits_b"]["word_edits"] for r in results)
+    total_char_edits_b = sum(r["edits_b"]["char_edits"] for r in results)
+
+    corpus_wer_a = (total_word_edits_a / total_ref_words * 100.0) if total_ref_words > 0 else 0.0
+    corpus_cer_a = (total_char_edits_a / total_ref_chars * 100.0) if total_ref_chars > 0 else 0.0
+
+    corpus_wer_b = (total_word_edits_b / total_ref_words * 100.0) if total_ref_words > 0 else 0.0
+    corpus_cer_b = (total_char_edits_b / total_ref_chars * 100.0) if total_ref_chars > 0 else 0.0
+
+    # Per-clip mean error rates
     mean_wer_a = statistics.mean(r["wer_a"] for r in results) * 100.0
     mean_cer_a = statistics.mean(r["cer_a"] for r in results) * 100.0
     mean_wer_b = statistics.mean(r["wer_b"] for r in results) * 100.0
@@ -153,53 +203,81 @@ def main():
 
     median_sec_b = statistics.median(latencies_b)
     p95_sec_b = compute_p95(latencies_b)
-    wer_diff = mean_wer_b - mean_wer_a
 
-    # Print summary table
-    print("\n" + "=" * 70)
+    # The 1.0-point gate uses the corpus-level WER
+    wer_diff = corpus_wer_b - corpus_wer_a
+
+    # Print summary table with both corpus and per-clip mean error rates
+    print("\n" + "=" * 96)
     print("ACCURACY GATE RESULTS: Kathbath Telugu Valid (60 clips)")
-    print("=" * 70)
-    print(f"{'Model':<40} | {'WER (%)':<10} | {'CER (%)':<10}")
-    print("-" * 70)
-    print(f"{'(a) Original NeMo (koyal-te-120m-1.0)':<40} | {mean_wer_a:>9.2f}% | {mean_cer_a:>9.2f}%")
-    print(f"{'(b) model.int8.onnx (sherpa-onnx 1.13.8)':<40} | {mean_wer_b:>9.2f}% | {mean_cer_b:>9.2f}%")
-    print("-" * 70)
-    print(f"WER degradation ((b) - (a)): {wer_diff:+.2f} percentage points (threshold: <= 1.00)")
+    print("=" * 96)
+    print(f"{'Model':<40} | {'Corpus WER':<11} | {'Mean WER':<10} | {'Corpus CER':<11} | {'Mean CER':<10}")
+    print("-" * 96)
+    print(
+        f"{'(a) Original NeMo (koyal-te-120m-1.0)':<40} | "
+        f"{corpus_wer_a:>10.2f}% | {mean_wer_a:>9.2f}% | "
+        f"{corpus_cer_a:>10.2f}% | {mean_cer_a:>9.2f}%"
+    )
+    print(
+        f"{'(b) model.int8.onnx (sherpa-onnx 1.13.8)':<40} | "
+        f"{corpus_wer_b:>10.2f}% | {mean_wer_b:>9.2f}% | "
+        f"{corpus_cer_b:>10.2f}% | {mean_cer_b:>9.2f}%"
+    )
+    print("-" * 96)
+    print(f"Corpus-level WER degradation ((b) - (a)): {wer_diff:+.2f} percentage points (threshold: <= 1.00)")
+    print(f"Per-clip mean WER degradation: {mean_wer_b - mean_wer_a:+.2f} percentage points")
     print(f"Runner CPU Latency for (b): Median = {median_sec_b:.3f} s/clip, 95th-percentile = {p95_sec_b:.3f} s/clip")
-    print("=" * 70 + "\n")
+    print(f"Total reference volume: {total_ref_words} words, {total_ref_chars} characters across {len(results)} clips")
+    print("=" * 96 + "\n")
 
     summary = {
         "dataset": "ai4bharat/Kathbath",
         "split": "valid",
         "clips": len(results),
+        "gate_metric": "corpus_wer",
+        "total_reference_words": total_ref_words,
+        "total_reference_chars": total_ref_chars,
         "nemo_original": {
-            "wer_pct": round(mean_wer_a, 2),
-            "cer_pct": round(mean_cer_a, 2),
+            "corpus_wer_pct": round(corpus_wer_a, 2),
+            "mean_wer_pct": round(mean_wer_a, 2),
+            "corpus_cer_pct": round(corpus_cer_a, 2),
+            "mean_cer_pct": round(mean_cer_a, 2),
+            "total_edits_word": total_word_edits_a,
+            "total_edits_char": total_char_edits_a,
+            "wer_pct": round(corpus_wer_a, 2),
+            "cer_pct": round(corpus_cer_a, 2),
         },
         "onnx_int8_sherpa": {
-            "wer_pct": round(mean_wer_b, 2),
-            "cer_pct": round(mean_cer_b, 2),
+            "corpus_wer_pct": round(corpus_wer_b, 2),
+            "mean_wer_pct": round(mean_wer_b, 2),
+            "corpus_cer_pct": round(corpus_cer_b, 2),
+            "mean_cer_pct": round(mean_cer_b, 2),
+            "total_edits_word": total_word_edits_b,
+            "total_edits_char": total_char_edits_b,
+            "wer_pct": round(corpus_wer_b, 2),
+            "cer_pct": round(corpus_cer_b, 2),
             "latency_median_sec": round(median_sec_b, 3),
             "latency_p95_sec": round(p95_sec_b, 3),
         },
         "wer_degradation_points": round(wer_diff, 2),
         "threshold_points": 1.0,
         "gate_passed": bool(wer_diff <= 1.0),
+        "installed_versions": installed_versions,
     }
 
     if args.out_results:
         args.out_results.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
-    # Hard gate check
+    # Hard gate check: 1.0 point on corpus-level WER
     if wer_diff > 1.0:
         print(
-            f"::error::ACCURACY GATE FAILED: model.int8.onnx WER is {wer_diff:.2f} points worse than original NeMo model "
+            f"::error::ACCURACY GATE FAILED: model.int8.onnx corpus WER is {wer_diff:.2f} points worse than original NeMo model "
             f"(exceeds 1.0 point limit).",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    print("::notice::ACCURACY GATE PASSED: WER degradation is within 1.0 point limit.")
+    print("::notice::ACCURACY GATE PASSED: Corpus WER degradation is within 1.0 point limit.")
     return 0
 
 
