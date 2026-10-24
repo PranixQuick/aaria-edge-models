@@ -1,0 +1,15 @@
+# Dependencies for Adalat AI Koyal te-120M conversion & accuracy gate workflow
+# PyTorch is installed via CPU index unpinned:
+#   pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+onnx==1.20.1
+onnxruntime==1.20.1
+sherpa-onnx==1.13.8
+nemo_toolkit[asr]
+lightning<=2.4.0,>2.2.1
+pytorch_lightning<=2.4.0,>2.2.1
+pytorch_metric_learning
+transformers
+soundfile
+datasets
+huggingface-hub
+httpx
