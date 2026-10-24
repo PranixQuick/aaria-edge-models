@@ -7,6 +7,7 @@ Process:
 2. Extracts subsampling_factor directly from model config (asr_model.cfg.encoder.subsampling_factor,
    falling back to asr_model.encoder.subsampling_factor); stops with error if neither exists.
 3. Configures model for CTC decoding (single language, NO slicing).
+   For hybrid models (RNNT + CTC), strictly switches to CTC; stops with error on failure.
 4. Extracts vocabulary from model tokenizer / decoder and writes tokens.txt with <blk>.
 5. Exports CTC graph to ONNX.
 6. Injects metadata properties required by sherpa-onnx NeMo CTC offline recognizer.
@@ -16,6 +17,21 @@ import argparse
 import os
 import sys
 from pathlib import Path
+
+
+def is_hybrid_model(model) -> bool:
+    """
+    Check if model is a hybrid (has both RNNT and CTC heads).
+    Criteria:
+    - class name contains "Hybrid"
+    - OR has a ctc_decoder attribute alongside a decoder or joint attribute
+    """
+    class_name = type(model).__name__
+    if "Hybrid" in class_name:
+        return True
+    has_ctc = hasattr(model, "ctc_decoder")
+    has_rnnt = hasattr(model, "decoder") or hasattr(model, "joint")
+    return bool(has_ctc and has_rnnt)
 
 
 def extract_vocabulary(asr_model):
@@ -134,20 +150,27 @@ def main():
         sys.exit(f"Error: {e}")
     print(f"Model subsampling factor extracted: {subsampling_factor}")
 
-    # Configure CTC decoding / export
-    if hasattr(asr_model, "change_decoding_strategy"):
+    # Configure CTC decoding / export strictly for hybrid models
+    if is_hybrid_model(asr_model):
+        print(f"Hybrid model detected ({type(asr_model).__name__}): switching decoding strategy to CTC...")
         try:
+            if not hasattr(asr_model, "change_decoding_strategy"):
+                raise AttributeError(f"Hybrid model {type(asr_model).__name__} lacks change_decoding_strategy method")
             asr_model.change_decoding_strategy(decoder_type="ctc")
             print("Changed decoding strategy to CTC.")
         except Exception as e:
-            print(f"Notice: change_decoding_strategy: {e}")
+            print(f"::error::Failed to switch hybrid model decoding strategy to CTC: {e}", file=sys.stderr)
+            sys.exit(1)
 
-    if hasattr(asr_model, "set_export_config"):
         try:
-            asr_model.set_export_config({"decoder_type": "ctc"})
-            print("Set export config decoder_type='ctc'.")
+            if hasattr(asr_model, "set_export_config"):
+                asr_model.set_export_config({"decoder_type": "ctc"})
+                print("Set export config decoder_type='ctc'.")
         except Exception as e:
-            print(f"Notice: set_export_config: {e}")
+            print(f"::error::Failed to set export config decoder_type to CTC: {e}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print(f"Pure CTC model detected ({type(asr_model).__name__}); leaving decoding strategy as-is.")
 
     # Set preprocessor parameters for inference stability
     if hasattr(asr_model, "preprocessor") and hasattr(asr_model.preprocessor, "featurizer"):

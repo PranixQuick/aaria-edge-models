@@ -115,6 +115,7 @@ def main():
 
     rows = []
     taken = 0
+    skipped_count = 0
     total_audio_bytes = 0
 
     for example in ds:
@@ -123,9 +124,11 @@ def main():
         try:
             text = (example.get(text_col) or "").strip()
             if not text:
+                skipped_count += 1
                 continue
             raw_audio = (example.get(audio_col) or {}).get("bytes")
             if not raw_audio:
+                skipped_count += 1
                 continue
 
             name = f"kathbath_te_{taken:03d}.wav"
@@ -143,18 +146,25 @@ def main():
             rows.append(row)
             taken += 1
         except Exception as e:
-            print(f"Skipping clip {taken} due to error: {e}", file=sys.stderr)
+            skipped_count += 1
+            print(f"Skipping clip due to error: {e}", file=sys.stderr)
             continue
 
     with open(args.manifest, "w", encoding="utf-8") as f:
         for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            f.write(json.dumps(r, ensure_ascii=False) + "
+")
 
     print(f"Successfully fetched {len(rows)} clips to {args.out_dir}; manifest written to {args.manifest}")
+    print(f"Skipped clips: {skipped_count}")
     print(f"[BANDWIDTH] Kathbath audio stream: {total_audio_bytes / (1024 * 1024):.2f} MB")
 
-    if len(rows) < 40:
-        sys.exit(f"Fetched {len(rows)} clips, which is below the 40-clip bar for measurement.")
+    if len(rows) != args.count:
+        print(
+            f"::error::Collected {len(rows)} clips, which does not meet requirement of exactly {args.count} clips (skipped {skipped_count}).",
+            file=sys.stderr,
+        )
+        sys.exit(f"Fetched {len(rows)} clips, but must be exactly {args.count} clips.")
     return 0
 
 
