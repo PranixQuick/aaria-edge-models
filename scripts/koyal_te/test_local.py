@@ -21,6 +21,7 @@ from score_gate import (
     check_manifest_entries,
     check_gate_rules,
     is_hybrid_model,
+    transcribe_nemo,
 )
 
 
@@ -332,6 +333,95 @@ def test_license_content():
     print("  -> license content tests passed!")
 
 
+def test_sherpa_onnx_api_contract():
+    print("Testing sherpa-onnx API contract and score_gate decode call...")
+    score_gate_p = Path(__file__).resolve().parent / "score_gate.py"
+    score_gate_src = score_gate_p.read_text(encoding="utf-8")
+    assert ".decode(stream)" not in score_gate_src, (
+        "score_gate.py must not call .decode(stream); use recognizer.decode_stream(stream)"
+    )
+    assert "recognizer.decode_stream(stream)" in score_gate_src, (
+        "score_gate.py must call recognizer.decode_stream(stream)"
+    )
+
+    try:
+        import sherpa_onnx
+        rec_cls = sherpa_onnx.OfflineRecognizer
+        assert hasattr(rec_cls, "from_nemo_ctc"), "OfflineRecognizer must have from_nemo_ctc"
+        assert hasattr(rec_cls, "create_stream"), "OfflineRecognizer must have create_stream"
+        assert hasattr(rec_cls, "decode_stream"), "OfflineRecognizer must have decode_stream"
+        assert not hasattr(rec_cls, "decode"), "OfflineRecognizer must not have decode"
+        print("  -> sherpa-onnx imported and OfflineRecognizer API contract verified!")
+    except ImportError:
+        print("  -> sherpa_onnx not installed in environment; source contract checked.")
+    print("  -> API contract tests passed!")
+
+
+def test_transcribe_nemo_shapes():
+    print("Testing transcribe_nemo handling for various return shapes (hybrid CTC outputs)...")
+
+    class MockHypothesis:
+        def __init__(self, text):
+            self.text = text
+
+    class MockModel:
+        def __init__(self, output):
+            self.output = output
+
+        def transcribe(self, paths, verbose=False):
+            return self.output
+
+    # 1. List of strings
+    m1 = MockModel(["apple banana"])
+    assert transcribe_nemo(m1, Path("dummy.wav")) == "apple banana"
+
+    # 2. List of Hypothesis objects
+    m2 = MockModel([MockHypothesis("apple banana")])
+    assert transcribe_nemo(m2, Path("dummy.wav")) == "apple banana"
+
+    # 3. Tuple of list of strings
+    m3 = MockModel((["apple banana"], [0.95]))
+    assert transcribe_nemo(m3, Path("dummy.wav")) == "apple banana"
+
+    # 4. Tuple of list of Hypothesis objects
+    m4 = MockModel(([MockHypothesis("apple banana")], [0.95]))
+    assert transcribe_nemo(m4, Path("dummy.wav")) == "apple banana"
+
+    # 5. Tuple of strings directly
+    m5 = MockModel(("apple banana", [0.95]))
+    assert transcribe_nemo(m5, Path("dummy.wav")) == "apple banana"
+
+    # 6. Tuple of Hypothesis objects directly
+    m6 = MockModel((MockHypothesis("apple banana"), [0.95]))
+    assert transcribe_nemo(m6, Path("dummy.wav")) == "apple banana"
+
+    # 7. Single string
+    m7 = MockModel("apple banana")
+    assert transcribe_nemo(m7, Path("dummy.wav")) == "apple banana"
+
+    # 8. Single Hypothesis object
+    m8 = MockModel(MockHypothesis("apple banana"))
+    assert transcribe_nemo(m8, Path("dummy.wav")) == "apple banana"
+
+    # 9. Empty list
+    m9 = MockModel([])
+    assert transcribe_nemo(m9, Path("dummy.wav")) == ""
+
+    # 10. Empty tuple
+    m10 = MockModel(())
+    assert transcribe_nemo(m10, Path("dummy.wav")) == ""
+
+    # 11. None or empty string
+    m11 = MockModel(None)
+    assert transcribe_nemo(m11, Path("dummy.wav")) == ""
+
+    # 12. Hypothesis with None text
+    m12 = MockModel([MockHypothesis(None)])
+    assert transcribe_nemo(m12, Path("dummy.wav")) == ""
+
+    print("  -> all transcribe_nemo return shapes handled successfully!")
+
+
 if __name__ == "__main__":
     test_all_scripts_compile()
     test_fetch_kathbath_import()
@@ -348,4 +438,6 @@ if __name__ == "__main__":
     test_subsampling_factor_extraction()
     test_model_json_format()
     test_license_content()
+    test_sherpa_onnx_api_contract()
+    test_transcribe_nemo_shapes()
     print("\nALL LOCAL UNIT CHECKS PASSED.")
