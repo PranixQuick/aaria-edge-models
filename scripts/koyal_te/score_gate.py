@@ -231,9 +231,12 @@ def to_16k_mono_file(src_path: Path, dst_path: Path):
 def transcribe_nemo(model, wav_path: Path) -> str:
     """Transcribe single clip using original NeMo ASRModel."""
     out = model.transcribe([str(wav_path)], verbose=False)
-    if isinstance(out, tuple):
+    if isinstance(out, tuple) and len(out) > 0:
         out = out[0]
-    first = out[0]
+    if isinstance(out, (list, tuple)):
+        first = out[0] if len(out) > 0 else ""
+    else:
+        first = out
     text = getattr(first, "text", first)
     return str(text or "")
 
@@ -250,7 +253,7 @@ def transcribe_sherpa_onnx(recognizer, wav_path: Path):
     stream.accept_waveform(sample_rate, audio)
 
     t0 = time.perf_counter()
-    recognizer.decode(stream)
+    recognizer.decode_stream(stream)
     latency_sec = time.perf_counter() - t0
 
     result_text = stream.result.text
