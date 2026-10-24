@@ -152,8 +152,7 @@ def main():
 
     with open(args.manifest, "w", encoding="utf-8") as f:
         for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "
-")
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     print(f"Successfully fetched {len(rows)} clips to {args.out_dir}; manifest written to {args.manifest}")
     print(f"Skipped clips: {skipped_count}")

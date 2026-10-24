@@ -4,6 +4,7 @@ Unit tests for the scorer, gate hardening, and conversion pieces (runs locally w
 """
 
 import json
+import py_compile
 import tempfile
 from pathlib import Path
 from normalise import cer, compute_edits_and_lengths, normalise, wer
@@ -36,6 +37,17 @@ def make_mock_result(audio_name, ref_text, hyp_a, hyp_b):
         "edits_b": edits_b,
         "latency_b_sec": 0.05,
     }
+
+
+def test_all_scripts_compile():
+    print("Testing that every script in scripts/koyal_te compiles...")
+    script_dir = Path(__file__).resolve().parent
+    py_files = sorted(script_dir.glob("*.py"))
+    assert len(py_files) > 0, "No Python files found in scripts/koyal_te"
+    for py_file in py_files:
+        print(f"  -> py_compile.compile: {py_file.name}")
+        py_compile.compile(str(py_file), doraise=True)
+    print(f"  -> all {len(py_files)} scripts compiled successfully!")
 
 
 def test_normalise():
@@ -281,6 +293,7 @@ def test_license_content():
 
 
 if __name__ == "__main__":
+    test_all_scripts_compile()
     test_normalise()
     test_corpus_wer_vs_mean_gate()
     test_gate_logic()
