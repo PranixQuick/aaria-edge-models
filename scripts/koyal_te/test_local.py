@@ -4,7 +4,10 @@ Unit tests for the scorer, gate hardening, and conversion pieces (runs locally w
 """
 
 import json
+import os
 import py_compile
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from normalise import cer, compute_edits_and_lengths, normalise, wer
@@ -57,6 +60,34 @@ def test_fetch_kathbath_import():
     assert hasattr(fetch_kathbath, "to_16k_mono_file"), "fetch_kathbath must define to_16k_mono_file"
     assert fetch_kathbath.DEFAULT_COUNT == 60, "fetch_kathbath DEFAULT_COUNT must be 60"
     print("  -> fetch_kathbath imported cleanly as a module!")
+
+def test_fetch_kathbath_exit_message():
+    print("Testing that fetch_kathbath prints exit reason to stderr when stopping...")
+    script_path = Path(__file__).resolve().parent / "fetch_kathbath.py"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        out_dir = tmp_path / "audio"
+        manifest = tmp_path / "m.jsonl"
+        env = dict(os.environ)
+        for token_var in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACEHUB_API_TOKEN"):
+            env.pop(token_var, None)
+        cmd = [
+            sys.executable,
+            str(script_path),
+            "--count",
+            "1",
+            "--out-dir",
+            str(out_dir),
+            "--manifest",
+            str(manifest),
+        ]
+        proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        assert proc.returncode == 1, f"Expected returncode 1, got {proc.returncode}"
+        assert "HF_TOKEN secret missing" in proc.stderr, (
+            f"Expected 'HF_TOKEN secret missing' in stderr, got:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+        )
+    print("  -> fetch_kathbath exit code 1 and exit reason printed to stderr as expected!")
+
 
 
 def test_normalise():
@@ -304,6 +335,7 @@ def test_license_content():
 if __name__ == "__main__":
     test_all_scripts_compile()
     test_fetch_kathbath_import()
+    test_fetch_kathbath_exit_message()
     test_normalise()
     test_corpus_wer_vs_mean_gate()
     test_gate_logic()

@@ -181,7 +181,13 @@ if __name__ == "__main__":
     try:
         code = main() or 0
     except SystemExit as exc:
-        code = exc.code if isinstance(exc.code, int) else (1 if exc.code else 0)
+        if exc.code is None:
+            code = 0
+        elif isinstance(exc.code, int):
+            code = exc.code
+        else:
+            print(exc.code, file=sys.stderr)
+            code = 1
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(code)
