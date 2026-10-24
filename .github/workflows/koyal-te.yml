@@ -1,0 +1,143 @@
+name: koyal-te
+
+# Conversion + accuracy gate workflow for Adalat AI Koyal te-120M
+# Exports CTC head to ONNX, quantizes to INT8, tests against Kathbath Telugu valid (60 clips),
+# and creates draft release models-2026-10-koyal-te with te-koyal__ prefixed assets.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  convert-and-gate:
+    name: Convert Koyal te-120M and Accuracy Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check HF_TOKEN secret
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "::error::HF_TOKEN secret missing"
+            echo "HF_TOKEN secret missing"
+            exit 1
+          fi
+          echo "HF_TOKEN secret is present."
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Total bandwidth note (Estimated)
+        run: |
+          echo "================================================================="
+          echo "TOTAL ESTIMATED EXTERNAL BANDWIDTH BUDGET FOR RUN:"
+          echo "1. PyTorch CPU & dependencies: ~1.2 GB"
+          echo "2. NeMo toolkit & audio libraries: ~0.8 GB"
+          echo "3. adalat-ai/koyal-te-120m-1.0 checkpoint (.nemo): ~480 MB"
+          echo "4. Kathbath Telugu valid audio (60 clips): ~10 MB"
+          echo "Total estimated download: ~2.5 GB"
+          echo "================================================================="
+
+      - name: Install PyTorch CPU & dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.3.1 torchaudio==2.3.1
+          pip install -r scripts/koyal_te/requirements.txt
+          python -c "import nemo; print('NeMo version:', nemo.__version__)"
+          python -c "import sherpa_onnx; print('sherpa-onnx version:', sherpa_onnx.__version__)"
+
+      - name: Download model from Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python scripts/koyal_te/download.py \
+            --repo "adalat-ai/koyal-te-120m-1.0" \
+            --out-dir "build/raw_model"
+
+      - name: Export CTC head to ONNX & tokens.txt
+        run: |
+          python scripts/koyal_te/export_ctc.py \
+            --nemo-path "build/raw_model/koyal-te-120m-1.0.nemo" \
+            --out-onnx "build/exported/model.onnx" \
+            --out-tokens "build/exported/tokens.txt" \
+            --subsampling-factor 4
+
+      - name: Dynamic INT8 Quantization
+        run: |
+          python scripts/koyal_te/quantize.py \
+            --in-onnx "build/exported/model.onnx" \
+            --out-onnx "build/exported/model.int8.onnx" \
+            --out-json "build/exported/model.json"
+
+      - name: Fetch Kathbath Telugu valid split (60 clips)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python scripts/koyal_te/fetch_kathbath.py \
+            --count 60 \
+            --out-dir "build/eval_audio" \
+            --manifest "build/eval_manifest.jsonl"
+
+      - name: Run Accuracy Gate
+        run: |
+          python scripts/koyal_te/score_gate.py \
+            --nemo-path "build/raw_model/koyal-te-120m-1.0.nemo" \
+            --onnx-model "build/exported/model.int8.onnx" \
+            --tokens "build/exported/tokens.txt" \
+            --manifest "build/eval_manifest.jsonl" \
+            --audio-dir "build/eval_audio" \
+            --out-results "build/accuracy_results.json"
+
+      - name: Prepare release assets & license notice
+        run: |
+          mkdir -p build/release_assets
+          python scripts/koyal_te/make_license.py \
+            --readme "build/raw_model/README.md" \
+            --out "build/release_assets/te-koyal__LICENSE-koyal-te-120m.txt"
+
+          cp build/exported/model.int8.onnx build/release_assets/te-koyal__model.int8.onnx
+          cp build/exported/tokens.txt build/release_assets/te-koyal__tokens.txt
+          cp build/exported/model.json build/release_assets/te-koyal__model.json
+
+          echo "================================================================="
+          echo "RELEASE ASSETS SUMMARY (Size and SHA-256):"
+          echo "================================================================="
+          cd build/release_assets
+          for f in *; do
+            sz=$(stat -c%s "$f")
+            hsh=$(sha256sum "$f" | awk '{print $1}')
+            echo "$f: size=$sz bytes, sha256=$hsh"
+          done
+          cd ../..
+
+      - name: Create DRAFT release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: "models-2026-10-koyal-te"
+        run: |
+          echo "Publishing DRAFT release: $TAG"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists; uploading assets..."
+            gh release upload "$TAG" build/release_assets/* --clobber
+          else
+            echo "Creating new draft release $TAG..."
+            gh release create "$TAG" build/release_assets/* \
+              --draft \
+              --title "$TAG" \
+              --notes "Adalat AI Koyal te-120M on-phone Telugu recogniser (draft)"
+          fi
+          echo "Draft release assets uploaded successfully."
