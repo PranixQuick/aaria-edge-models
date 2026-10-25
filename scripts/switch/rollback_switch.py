@@ -7,7 +7,8 @@ then downloads them from the release and requires:
 1. Byte-for-byte equality of downloaded manifest with saved previous copy.
 2. Byte-for-byte equality of downloaded signature with saved previous copy.
 3. Cryptographically valid signature against release public key. If public key is missing, FAILS.
-4. If live manifest already matches saved previous bytes, skips re-upload entirely
+4. If live manifest.json and manifest.json.sig BOTH already match saved previous bytes
+   AND cryptographically verify against the release public key, skips re-upload entirely
    and prints "Live manifest unchanged - nothing to roll back".
 """
 
@@ -48,16 +49,25 @@ def verify_signature(manifest_bytes: bytes, sig_bytes: bytes, pubkey_b64: str) -
     pub_key.verify(sig_bytes, manifest_bytes, ec.ECDSA(hashes.SHA256()))
 
 
-def check_live_manifest_matches_saved(release: str, saved_manifest_bytes: bytes, check_dir: Path = None) -> bool:
+def check_live_pair_matches_saved(
+    release: str,
+    saved_manifest_bytes: bytes,
+    saved_sig_bytes: bytes,
+    pubkey_b64: str,
+    check_dir: Path = None,
+) -> bool:
     """
-    Download live manifest.json from release and check if it already equals saved_manifest_bytes.
-    Returns True if identical, False if mismatch or download failed.
+    Download live manifest.json and manifest.json.sig from release.
+    Skip rollback ONLY if BOTH:
+    1. Are byte-for-byte identical to the saved previous copies.
+    2. Cryptographically verify against the release public key.
+    Returns True if skip condition is met, False otherwise.
     """
     if check_dir is None:
         check_dir = Path("rollback_pre_check")
     check_dir.mkdir(parents=True, exist_ok=True)
     dl = subprocess.run(
-        ["gh", "release", "download", release, "-p", "manifest.json", "-D", str(check_dir), "--clobber"],
+        ["gh", "release", "download", release, "-p", "manifest.json", "-p", "manifest.json.sig", "-D", str(check_dir), "--clobber"],
         capture_output=True,
         text=True,
     )
@@ -65,10 +75,29 @@ def check_live_manifest_matches_saved(release: str, saved_manifest_bytes: bytes,
         return False
 
     live_manifest_path = check_dir / "manifest.json"
-    if not live_manifest_path.is_file():
+    live_sig_path = check_dir / "manifest.json.sig"
+    if not live_manifest_path.is_file() or not live_sig_path.is_file():
         return False
 
-    return live_manifest_path.read_bytes() == saved_manifest_bytes
+    live_manifest_bytes = live_manifest_path.read_bytes()
+    live_sig_bytes = live_sig_path.read_bytes()
+
+    if live_manifest_bytes != saved_manifest_bytes or live_sig_bytes != saved_sig_bytes:
+        return False
+
+    try:
+        verify_signature(live_manifest_bytes, live_sig_bytes, pubkey_b64)
+        return True
+    except Exception as e:
+        print(f"Live manifest and signature match saved bytes but failed cryptographic verification: {e}", file=sys.stderr)
+        return False
+
+
+def check_live_manifest_matches_saved(release: str, saved_manifest_bytes: bytes, saved_sig_bytes: bytes = None, pubkey_b64: str = None, check_dir: Path = None) -> bool:
+    """Backward-compatible wrapper for check_live_pair_matches_saved."""
+    if saved_sig_bytes is not None and pubkey_b64 is not None:
+        return check_live_pair_matches_saved(release, saved_manifest_bytes, saved_sig_bytes, pubkey_b64, check_dir=check_dir)
+    return False
 
 
 def main(argv=None):
@@ -104,10 +133,11 @@ def main(argv=None):
 
     saved_manifest_bytes = saved_manifest_path.read_bytes()
     saved_sig_bytes = saved_sig_path.read_bytes()
+    pubkey_b64 = pubkey_path.read_text(encoding="utf-8")
 
-    # 2. Skip re-upload entirely when live manifest already equals saved previous bytes
-    print("Checking live release manifest before rollback...")
-    if check_live_manifest_matches_saved(args.release, saved_manifest_bytes):
+    # 2. Skip re-upload entirely ONLY when live pair matches saved previous bytes AND verifies
+    print("Checking live release manifest and signature before rollback...")
+    if check_live_pair_matches_saved(args.release, saved_manifest_bytes, saved_sig_bytes, pubkey_b64):
         print("Live manifest unchanged - nothing to roll back")
         return 0
 

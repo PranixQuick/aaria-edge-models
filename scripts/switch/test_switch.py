@@ -605,40 +605,285 @@ def test_missing_key_fails_rollback():
         print("  -> Missing public key correctly causes rollback failure!")
 
 
-def test_unchanged_manifest_no_rollback_upload():
-    print("Testing that unchanged live manifest skips rollback re-upload...")
+# ==============================================================================
+# Part 43f Tests
+# (a) live = old manifest + new sig -> rollback re-uploads both and ends with verified matching pair
+# (b) live = old pair -> skip
+# (c) live = new pair -> restore
+# (d) apply second-upload failure -> previous pair restored
+# ==============================================================================
+
+def test_rollback_live_old_manifest_new_sig_restores_pair():
+    print("Testing rollback when live = old manifest + new sig (must re-upload both and verify)...")
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
     with tempfile.TemporaryDirectory() as td:
         tpath = Path(td)
         current_dir = tpath / "current"
         current_dir.mkdir()
-        saved_bytes = b'{"version": 1, "status": "unchanged"}\n'
-        (current_dir / "manifest.json").write_bytes(saved_bytes)
-        (current_dir / "manifest.json.sig").write_bytes(b'dummy_sig')
-        (current_dir / "manifest_public_key.b64").write_text("dummy_pubkey", encoding="utf-8")
 
-        pre_check = Path("rollback_pre_check")
-        uploaded_files = []
+        saved_manifest_bytes = b'{"version": 1, "status": "old_manifest"}\n'
+        priv_key = ec.generate_private_key(ec.SECP256R1())
+        saved_sig_bytes = priv_key.sign(saved_manifest_bytes, ec.ECDSA(hashes.SHA256()))
+
+        pub_der = priv_key.public_key().public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        pubkey_b64 = base64.b64encode(pub_der).decode("ascii")
+
+        (current_dir / "manifest.json").write_bytes(saved_manifest_bytes)
+        (current_dir / "manifest.json.sig").write_bytes(saved_sig_bytes)
+        (current_dir / "manifest_public_key.b64").write_text(pubkey_b64, encoding="utf-8")
+
+        # New signature from another key (simulating old manifest + new signature on release)
+        new_priv_key = ec.generate_private_key(ec.SECP256R1())
+        new_sig_bytes = new_priv_key.sign(b'{"version": 1, "status": "new_manifest"}\n', ec.ECDSA(hashes.SHA256()))
+
+        # Simulated live release store: initially OLD manifest + NEW sig
+        live_store = {
+            "manifest.json": saved_manifest_bytes,
+            "manifest.json.sig": new_sig_bytes,
+        }
+
+        uploaded_batches = []
         orig_run = subprocess.run
+
         def mock_run(cmd, *a, **kw):
             if "download" in cmd:
-                pre_check.mkdir(parents=True, exist_ok=True)
-                (pre_check / "manifest.json").write_bytes(saved_bytes)
+                dest_dir = Path(cmd[cmd.index("-D") + 1])
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                (dest_dir / "manifest.json").write_bytes(live_store["manifest.json"])
+                (dest_dir / "manifest.json.sig").write_bytes(live_store["manifest.json.sig"])
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             if "upload" in cmd:
-                uploaded_files.append(cmd)
+                uploaded_batches.append(cmd)
+                for farg in cmd:
+                    p = Path(farg)
+                    if p.name in live_store:
+                        live_store[p.name] = p.read_bytes()
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             return orig_run(cmd, *a, **kw)
 
         try:
             subprocess.run = mock_run
             res = rollback_switch.main(["--current-dir", str(current_dir)])
-            assert res == 0, f"Expected 0 exit when live manifest is unchanged, got {res}"
-            assert len(uploaded_files) == 0, f"Expected NO upload calls when live manifest unchanged, got: {uploaded_files}"
+            assert res == 0, f"Expected 0 exit code from rollback, got {res}"
+            assert len(uploaded_batches) > 0, "Expected upload to be called when signature mismatched!"
+            assert live_store["manifest.json"] == saved_manifest_bytes
+            assert live_store["manifest.json.sig"] == saved_sig_bytes
         finally:
             subprocess.run = orig_run
-            if pre_check.is_dir():
-                shutil.rmtree(pre_check, ignore_errors=True)
-        print("  -> Unchanged live manifest correctly skips rollback re-upload and exits 0!")
+        print("  -> Rollback correctly caught old manifest + new sig mismatch, restored and verified pair!")
+
+
+def test_rollback_live_old_pair_skips():
+    print("Testing rollback when live = old pair (must skip upload entirely)...")
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    with tempfile.TemporaryDirectory() as td:
+        tpath = Path(td)
+        current_dir = tpath / "current"
+        current_dir.mkdir()
+
+        saved_manifest_bytes = b'{"version": 1, "status": "identical_old_pair"}\n'
+        priv_key = ec.generate_private_key(ec.SECP256R1())
+        saved_sig_bytes = priv_key.sign(saved_manifest_bytes, ec.ECDSA(hashes.SHA256()))
+
+        pub_der = priv_key.public_key().public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        pubkey_b64 = base64.b64encode(pub_der).decode("ascii")
+
+        (current_dir / "manifest.json").write_bytes(saved_manifest_bytes)
+        (current_dir / "manifest.json.sig").write_bytes(saved_sig_bytes)
+        (current_dir / "manifest_public_key.b64").write_text(pubkey_b64, encoding="utf-8")
+
+        # Simulated live release store: identical old pair
+        live_store = {
+            "manifest.json": saved_manifest_bytes,
+            "manifest.json.sig": saved_sig_bytes,
+        }
+
+        uploaded_batches = []
+        orig_run = subprocess.run
+
+        def mock_run(cmd, *a, **kw):
+            if "download" in cmd:
+                dest_dir = Path(cmd[cmd.index("-D") + 1])
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                (dest_dir / "manifest.json").write_bytes(live_store["manifest.json"])
+                (dest_dir / "manifest.json.sig").write_bytes(live_store["manifest.json.sig"])
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if "upload" in cmd:
+                uploaded_batches.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return orig_run(cmd, *a, **kw)
+
+        try:
+            subprocess.run = mock_run
+            res = rollback_switch.main(["--current-dir", str(current_dir)])
+            assert res == 0, f"Expected 0 exit code when live pair matches, got {res}"
+            assert len(uploaded_batches) == 0, f"Expected NO upload calls when live pair matches, got {uploaded_batches}"
+        finally:
+            subprocess.run = orig_run
+        print("  -> Rollback correctly skipped re-upload when live pair already matches and verifies!")
+
+
+def test_unchanged_manifest_no_rollback_upload():
+    test_rollback_live_old_pair_skips()
+
+
+def test_rollback_live_new_pair_restores_pair():
+    print("Testing rollback when live = new pair (must re-upload old pair and verify)...")
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    with tempfile.TemporaryDirectory() as td:
+        tpath = Path(td)
+        current_dir = tpath / "current"
+        current_dir.mkdir()
+
+        saved_manifest_bytes = b'{"version": 1, "status": "saved_old_pair"}\n'
+        priv_key_old = ec.generate_private_key(ec.SECP256R1())
+        saved_sig_bytes = priv_key_old.sign(saved_manifest_bytes, ec.ECDSA(hashes.SHA256()))
+
+        pub_der = priv_key_old.public_key().public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        pubkey_b64 = base64.b64encode(pub_der).decode("ascii")
+
+        (current_dir / "manifest.json").write_bytes(saved_manifest_bytes)
+        (current_dir / "manifest.json.sig").write_bytes(saved_sig_bytes)
+        (current_dir / "manifest_public_key.b64").write_text(pubkey_b64, encoding="utf-8")
+
+        # Simulated live release store: new pair
+        new_manifest_bytes = b'{"version": 1, "status": "new_koyal_pair"}\n'
+        priv_key_new = ec.generate_private_key(ec.SECP256R1())
+        new_sig_bytes = priv_key_new.sign(new_manifest_bytes, ec.ECDSA(hashes.SHA256()))
+
+        live_store = {
+            "manifest.json": new_manifest_bytes,
+            "manifest.json.sig": new_sig_bytes,
+        }
+
+        uploaded_batches = []
+        orig_run = subprocess.run
+
+        def mock_run(cmd, *a, **kw):
+            if "download" in cmd:
+                dest_dir = Path(cmd[cmd.index("-D") + 1])
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                (dest_dir / "manifest.json").write_bytes(live_store["manifest.json"])
+                (dest_dir / "manifest.json.sig").write_bytes(live_store["manifest.json.sig"])
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if "upload" in cmd:
+                uploaded_batches.append(cmd)
+                for farg in cmd:
+                    p = Path(farg)
+                    if p.name in live_store:
+                        live_store[p.name] = p.read_bytes()
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return orig_run(cmd, *a, **kw)
+
+        try:
+            subprocess.run = mock_run
+            res = rollback_switch.main(["--current-dir", str(current_dir)])
+            assert res == 0, f"Expected 0 exit code from rollback, got {res}"
+            assert len(uploaded_batches) > 0, "Expected upload to be called when live is new pair!"
+            assert live_store["manifest.json"] == saved_manifest_bytes
+            assert live_store["manifest.json.sig"] == saved_sig_bytes
+        finally:
+            subprocess.run = orig_run
+        print("  -> Rollback correctly restored and verified saved pair when live was new pair!")
+
+
+def test_apply_second_upload_failure_restores_previous_pair():
+    print("Testing apply when second upload (manifest.json) fails (must restore previous pair immediately)...")
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    with tempfile.TemporaryDirectory() as td:
+        tpath = Path(td)
+        current_dir = tpath / "current"
+        current_dir.mkdir()
+
+        # Previous manifest and signature
+        old_manifest_bytes = b'{"version": 1, "models": {"te": {"engine": "indicconformer"}}}\n'
+        priv_key = ec.generate_private_key(ec.SECP256R1())
+        old_sig_bytes = priv_key.sign(old_manifest_bytes, ec.ECDSA(hashes.SHA256()))
+
+        pub_der = priv_key.public_key().public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        pubkey_b64 = base64.b64encode(pub_der).decode("ascii")
+
+        (current_dir / "manifest.json").write_bytes(old_manifest_bytes)
+        (current_dir / "manifest.json.sig").write_bytes(old_sig_bytes)
+        (current_dir / "manifest_public_key.b64").write_text(pubkey_b64, encoding="utf-8")
+
+        # Plan manifest
+        plan_manifest_path = tpath / "plan_manifest.json"
+        new_manifest_bytes = b'{"version": 1, "models": {"te": {"engine": "indicconformer_updated"}}}\n'
+        plan_manifest_path.write_bytes(new_manifest_bytes)
+        expected_sha = hashlib.sha256(new_manifest_bytes).hexdigest()
+
+        # Signing key PEM in env
+        pem_key = priv_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        ).decode("ascii")
+        os.environ["AARIA_MODELS_SIGNING_KEY"] = pem_key
+
+        uploaded_commands = []
+        orig_run = subprocess.run
+
+        # Simulate upload failure only on the second active upload (manifest.json)
+        def mock_run(cmd, *a, **kw):
+            if "download" in cmd:
+                dest_dir = Path(cmd[cmd.index("-D") + 1])
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                (dest_dir / "manifest.json").write_bytes(old_manifest_bytes)
+                (dest_dir / "manifest.json.sig").write_bytes(old_sig_bytes)
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if "upload" in cmd:
+                uploaded_commands.append(cmd)
+                # Check if this is the second active upload (uploading plan_manifest.json)
+                if str(plan_manifest_path) in cmd:
+                    # Second upload fails!
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="Simulated network failure on second upload")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return orig_run(cmd, *a, **kw)
+
+        try:
+            subprocess.run = mock_run
+            res = apply_switch.main([
+                "--target", "indicconformer",
+                "--current-dir", str(current_dir),
+                "--plan-manifest", str(plan_manifest_path),
+                "--expected-sha256", expected_sha,
+            ])
+            # Must exit non-zero
+            assert res != 0, f"Expected non-zero exit from apply when second upload fails, got {res}"
+
+            # Verify that restore upload was called with both previous manifest and previous signature
+            restore_calls = [
+                c for c in uploaded_commands
+                if str(current_dir / "manifest.json") in c and str(current_dir / "manifest.json.sig") in c
+            ]
+            assert len(restore_calls) > 0, (
+                f"Expected immediate restore upload with previous pair! Upload calls were:\n{uploaded_commands}"
+            )
+        finally:
+            subprocess.run = orig_run
+            os.environ.pop("AARIA_MODELS_SIGNING_KEY", None)
+        print("  -> Apply correctly restored previous manifest pair immediately upon second upload failure!")
 
 
 def test_workflows_shell_syntax():
@@ -840,6 +1085,10 @@ if __name__ == "__main__":
     test_changed_live_manifest_stops_before_upload()
     test_missing_key_fails_rollback()
     test_unchanged_manifest_no_rollback_upload()
+    test_rollback_live_old_manifest_new_sig_restores_pair()
+    test_rollback_live_old_pair_skips()
+    test_rollback_live_new_pair_restores_pair()
+    test_apply_second_upload_failure_restores_previous_pair()
     test_workflows_shell_syntax()
     test_py_compile_new_scripts()
     test_workflows_yaml()

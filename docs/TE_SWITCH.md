@@ -88,12 +88,12 @@ When `dry_run: false`, the `apply` job executes a fail-safe, atomic sequence:
    - It asserts that the live manifest is **byte-identical** to the baseline copy the plan started from (`current_rel/manifest.json`).
    - If any concurrent modification occurred, it aborts immediately with a clear error without uploading the new manifest.
 5. **Audit Backup**: Current `manifest.json` and `.sig` are archived as `manifest-previous-<UTC timestamp>.json` and `manifest-previous-<UTC timestamp>.json.sig` on the release (no clobber).
-6. **Manifest Atomic Update**: New `manifest.json.sig` and `manifest.json` are uploaded together (--clobber) with retries.
+6. **Manifest Atomic Update**: New `manifest.json.sig` is uploaded first, followed by `manifest.json` (--clobber) with retries. If the second upload fails, the previous pair is immediately restored before exiting non-zero.
 7. **Exact After-Check**: The workflow downloads `manifest.json` and `manifest.json.sig` from the public release URL and requires **exact byte-for-byte equality** with the locally signed manifest and signature, plus a passing cryptographic verification.
 
 ### Automatic Rollback on Failure
 If any failure occurs during the live apply step (network disruption, upload failure, or verification mismatch), the final step triggers automatically (`if: (failure() || cancelled()) && steps.apply_switch.outcome != 'skipped'`):
-- First inspects the live release manifest: if the live manifest already matches the saved previous bytes, it skips re-uploading entirely and prints `Live manifest unchanged - nothing to roll back`.
+- First inspects the live release manifest and signature: if both already match the saved previous bytes and verify with the public key, it skips re-uploading entirely and prints `Live manifest unchanged - nothing to roll back`.
 - If rollback is needed, re-uploads the saved previous `manifest.json` and `manifest.json.sig` using retries.
 - Re-downloads and cryptographically verifies the restored signature against `manifest_public_key.b64`. **If the public key is missing, rollback strictly fails.**
 - Logs clearly: `ROLLED BACK to previous manifest`.

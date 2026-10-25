@@ -338,9 +338,34 @@ def main(argv=None):
     print(f"Uploading immutable previous manifest history: {prev_manifest_name} and {prev_sig_name} (no clobber)...")
     upload_with_retry(args.release, [ts_manifest, ts_sig], clobber=False)
 
-    # 9. Upload new manifest.json.sig and manifest.json (updating live active release)
-    print("Uploading active manifest.json.sig and manifest.json to live release...")
-    upload_with_retry(args.release, [sig_file, args.plan_manifest], clobber=True)
+    # 9. Upload active manifest.json.sig and manifest.json (updating live active release)
+    # Upload manifest.json.sig first, then manifest.json. If the second upload fails,
+    # immediately restore the saved previous pair before exiting non-zero.
+    prev_manifest = args.current_dir / "manifest.json"
+    prev_sig = args.current_dir / "manifest.json.sig"
+
+    print("Uploading active manifest.json.sig to live release...")
+    try:
+        upload_with_retry(args.release, [sig_file], clobber=True)
+    except Exception as e:
+        print(f"::error::Failed to upload active manifest.json.sig: {e}", file=sys.stderr)
+        return 1
+
+    print("Uploading active manifest.json to live release...")
+    try:
+        upload_with_retry(args.release, [args.plan_manifest], clobber=True)
+    except Exception as e:
+        print(
+            f"::error::Failed to upload active manifest.json after uploading signature! "
+            f"Immediately restoring saved previous manifest pair: {e}",
+            file=sys.stderr,
+        )
+        try:
+            upload_with_retry(args.release, [prev_manifest, prev_sig], clobber=True)
+            print("Successfully restored saved previous manifest pair after upload failure.")
+        except Exception as re:
+            print(f"::error::CRITICAL: Failed to restore previous manifest pair after upload failure: {re}", file=sys.stderr)
+        return 1
 
     # 10. Exact post-upload after-check: download and verify byte-for-byte equality & signature
     print("Performing exact post-upload after-check from live release...")
