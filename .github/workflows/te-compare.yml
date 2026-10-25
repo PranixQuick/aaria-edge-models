@@ -7,8 +7,11 @@ name: te-compare
 on:
   workflow_dispatch:
 
+# Permissions: contents: write is required ONLY so github.token can query and list draft
+# releases via GitHub REST API (models-2026-10-koyal-te). This job never receives
+# AARIA_MODELS_SIGNING_KEY and uploads nothing to releases.
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   compare:
@@ -54,12 +57,12 @@ jobs:
 
       - name: Download Koyal model from draft release (models-2026-10-koyal-te)
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p build/koyal
-          gh release download models-2026-10-koyal-te \
-            -p "te-koyal__*" \
-            -D build/koyal
+          python scripts/switch/fetch_draft_assets.py \
+            --tag "models-2026-10-koyal-te" \
+            --assets "te-koyal__model.int8.onnx" "te-koyal__tokens.txt" "te-koyal__model.json" "te-koyal__LICENSE-koyal-te-120m.txt" \
+            --out-dir "build/koyal"
 
       - name: Run ONNX Comparison
         run: |

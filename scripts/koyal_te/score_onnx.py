@@ -66,17 +66,22 @@ def verify_against_manifest(manifest_path: Path, model_path: Path, tokens_path: 
 
     manifest_hashes = {f["name"]: f["sha256"] for f in files if "name" in f and "sha256" in f}
 
+    if "model.int8.onnx" not in manifest_hashes:
+        raise ValueError(f"Manifest {manifest_path.name} does not list 'model.int8.onnx' for te")
+    if "tokens.txt" not in manifest_hashes:
+        raise ValueError(f"Manifest {manifest_path.name} does not list 'tokens.txt' for te")
+
     actual_model_sha = sha256_file(model_path)
-    expected_model_sha = manifest_hashes.get("model.int8.onnx")
-    if expected_model_sha and actual_model_sha != expected_model_sha:
+    expected_model_sha = manifest_hashes["model.int8.onnx"]
+    if actual_model_sha != expected_model_sha:
         raise ValueError(
             f"SHA-256 mismatch for {model_path.name}: "
             f"actual={actual_model_sha}, expected in manifest={expected_model_sha}"
         )
 
     actual_tokens_sha = sha256_file(tokens_path)
-    expected_tokens_sha = manifest_hashes.get("tokens.txt")
-    if expected_tokens_sha and actual_tokens_sha != expected_tokens_sha:
+    expected_tokens_sha = manifest_hashes["tokens.txt"]
+    if actual_tokens_sha != expected_tokens_sha:
         raise ValueError(
             f"SHA-256 mismatch for {tokens_path.name}: "
             f"actual={actual_tokens_sha}, expected in manifest={expected_tokens_sha}"
@@ -286,7 +291,17 @@ def main():
     # 6. Evaluate Model B if provided
     metrics_b = None
     clips_b = None
+    koyal_sha = None
     if args.model_b and args.tokens_b:
+        koyal_model_sha = sha256_file(args.model_b)
+        koyal_tokens_sha = sha256_file(args.tokens_b)
+        print(f"Scored Koyal model SHA-256: {koyal_model_sha}")
+        print(f"Scored Koyal tokens SHA-256: {koyal_tokens_sha}")
+        koyal_sha = {
+            "model.int8.onnx": koyal_model_sha,
+            "tokens.txt": koyal_tokens_sha,
+        }
+
         try:
             rec_b = init_recognizer(args.model_b, args.tokens_b)
         except Exception as e:
@@ -308,6 +323,7 @@ def main():
     }
     if metrics_b:
         results_payload["model_b"] = metrics_b
+        results_payload["koyal_sha256"] = koyal_sha
         results_payload["difference"] = {
             "wer_diff_points": round(metrics_b["corpus_wer_pct"] - metrics_a["corpus_wer_pct"], 2),
             "cer_diff_points": round(metrics_b["corpus_cer_pct"] - metrics_a["corpus_cer_pct"], 2),
