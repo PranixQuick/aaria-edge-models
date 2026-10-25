@@ -79,35 +79,12 @@ jobs:
       - name: Download Koyal draft assets if target is koyal
         if: ${{ inputs.target == 'koyal' }}
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p draft_assets
-          gh release download models-2026-10-koyal-te \
-            -p "te-koyal__model.int8.onnx" \
-            -p "te-koyal__tokens.txt" \
-            -p "te-koyal__model.json" \
-            -p "te-koyal__LICENSE-koyal-te-120m.txt" \
-            -D draft_assets
-
-          echo "Validating downloaded draft assets (exact 4, no unexpected)..."
-          python - <<'PY'
-          import sys
-          from pathlib import Path
-          expected = {
-              "te-koyal__model.int8.onnx",
-              "te-koyal__tokens.txt",
-              "te-koyal__model.json",
-              "te-koyal__LICENSE-koyal-te-120m.txt",
-          }
-          found = {p.name for p in Path("draft_assets").iterdir() if p.is_file()}
-          unexpected = sorted([f for f in found if f.startswith("te-koyal__") and f not in expected])
-          if unexpected:
-              sys.exit(f"Unexpected te-koyal__ assets found in draft: {unexpected}")
-          missing = sorted([f for f in expected if f not in found])
-          if missing:
-              sys.exit(f"Missing required te-koyal__ assets from draft: {missing}")
-          print("Validated exact 4 Koyal draft assets.")
-          PY
+          python scripts/switch/fetch_draft_assets.py \
+            --tag "models-2026-10-koyal-te" \
+            --assets "te-koyal__model.int8.onnx" "te-koyal__tokens.txt" "te-koyal__model.json" "te-koyal__LICENSE-koyal-te-120m.txt" \
+            --out-dir "draft_assets"
 
       - name: Build new switch manifest and show diff
         run: |
@@ -169,34 +146,12 @@ jobs:
       - name: Download Koyal draft assets if target is koyal
         if: ${{ inputs.target == 'koyal' }}
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p draft_assets
-          gh release download models-2026-10-koyal-te \
-            -p "te-koyal__model.int8.onnx" \
-            -p "te-koyal__tokens.txt" \
-            -p "te-koyal__model.json" \
-            -p "te-koyal__LICENSE-koyal-te-120m.txt" \
-            -D draft_assets
-
-          python - <<'PY'
-          import sys
-          from pathlib import Path
-          expected = {
-              "te-koyal__model.int8.onnx",
-              "te-koyal__tokens.txt",
-              "te-koyal__model.json",
-              "te-koyal__LICENSE-koyal-te-120m.txt",
-          }
-          found = {p.name for p in Path("draft_assets").iterdir() if p.is_file()}
-          unexpected = sorted([f for f in found if f.startswith("te-koyal__") and f not in expected])
-          if unexpected:
-              sys.exit(f"Unexpected te-koyal__ assets in draft: {unexpected}")
-          missing = sorted([f for f in expected if f not in found])
-          if missing:
-              sys.exit(f"Missing required te-koyal__ assets in draft: {missing}")
-          print("Validated exact 4 Koyal draft assets.")
-          PY
+          python scripts/switch/fetch_draft_assets.py \
+            --tag "models-2026-10-koyal-te" \
+            --assets "te-koyal__model.int8.onnx" "te-koyal__tokens.txt" "te-koyal__model.json" "te-koyal__LICENSE-koyal-te-120m.txt" \
+            --out-dir "draft_assets"
 
       - name: Build new switch manifest
         run: |
