@@ -4,7 +4,7 @@ Build new manifest.json for Telugu model switch (Koyal or IndicConformer).
 
 Enforces all SyncManifest rules:
 - Manifest version == 1
-- HTTPS URLs only
+- Model file URLs must start with https://github.com/PranixQuick/aaria-edge-models/releases/download/models-2026-10/
 - No path traversal in filenames
 - Each single file <= 400 MB
 - Total model files <= 600 MB
@@ -12,6 +12,7 @@ Enforces all SyncManifest rules:
 - All non-target languages (en, hi) and replies stay byte-identical
 
 Prints total model size and unified diff against current manifest.
+Detects no-op changes (prints "No change - nothing to do" and exits 0).
 """
 
 import argparse
@@ -22,31 +23,16 @@ import sys
 from pathlib import Path
 
 BASE_RELEASE_URL = "https://github.com/PranixQuick/aaria-edge-models/releases/download/models-2026-10"
+REQUIRED_MODEL_URL_PREFIX = "https://github.com/PranixQuick/aaria-edge-models/releases/download/models-2026-10/"
 MAX_FILE_BYTES = 400 * 1024 * 1024   # 400 MB
 MAX_TOTAL_BYTES = 600 * 1024 * 1024  # 600 MB
 
-# Fallback known hashes and sizes for draft release models-2026-10-koyal-te assets
-KNOWN_KOYAL_ASSETS = {
-    "model.int8.onnx": {
-        "asset_name": "te-koyal__model.int8.onnx",
-        "bytes": 138417172,
-        "sha256": "8bbb11bd7cfe543148c49d24dba845395a8a683f82a63841ad6b90589e562781",
-    },
-    "tokens.txt": {
-        "asset_name": "te-koyal__tokens.txt",
-        "bytes": 5623,
-        "sha256": "2f915352a1589f34af9251801804b43c558f429504b9c42c56d2d71d4eafcea0",
-    },
-    "model.json": {
-        "asset_name": "te-koyal__model.json",
-        "bytes": 75,
-        "sha256": "1d8a8a2be5c31dd8dc0e25c38abe98725227e86d9c8acd015328c0a5106c476b",
-    },
-    "LICENSE": {
-        "asset_name": "te-koyal__LICENSE-koyal-te-120m.txt",
-        "bytes": 13076,
-        "sha256": "49d48f40a4ecc2bbc126ba54c46cde45f01d71f28d6b56b8932e374cec4deec6",
-    },
+# Exact four Koyal assets required from draft release
+KOYAL_REQUIRED_ASSETS = {
+    "LICENSE": "te-koyal__LICENSE-koyal-te-120m.txt",
+    "model.int8.onnx": "te-koyal__model.int8.onnx",
+    "model.json": "te-koyal__model.json",
+    "tokens.txt": "te-koyal__tokens.txt",
 }
 
 
@@ -61,27 +47,38 @@ def sha256_file(path: Path) -> str:
 
 def build_koyal_entry(draft_dir: Path = None) -> dict:
     """
-    Construct models.te entry for Koyal te-120M.
-    If draft_dir is provided and contains assets, computes bytes and sha256 dynamically.
+    Construct models.te entry for Koyal te-120M using downloaded draft assets.
+    Requires exact four files. Fails if draft_dir is missing, if any required file
+    is missing, or if unexpected te-koyal__ files are present.
     """
+    if draft_dir is None or not draft_dir.is_dir():
+        raise FileNotFoundError(
+            f"Draft directory containing Koyal assets is required for target 'koyal', got: {draft_dir}"
+        )
+
+    expected_names = set(KOYAL_REQUIRED_ASSETS.values())
+    found_files = {p.name: p for p in draft_dir.iterdir() if p.is_file()}
+
+    # Check for unexpected te-koyal__ files
+    unexpected = sorted([name for name in found_files if name.startswith("te-koyal__") and name not in expected_names])
+    if unexpected:
+        raise ValueError(
+            f"Unexpected te-koyal__ asset(s) found in draft directory {draft_dir}: {unexpected}"
+        )
+
+    # Check for missing required files
+    missing = sorted([name for name in expected_names if name not in found_files])
+    if missing:
+        raise FileNotFoundError(
+            f"Missing required Koyal draft asset(s) in {draft_dir}: {missing}"
+        )
+
     files = []
-    for role in sorted(KNOWN_KOYAL_ASSETS.keys()):
-        meta = KNOWN_KOYAL_ASSETS[role]
-        asset_name = meta["asset_name"]
-
-        file_bytes = meta["bytes"]
-        file_sha256 = meta["sha256"]
-
-        if draft_dir and draft_dir.is_dir():
-            candidates = [draft_dir / asset_name, draft_dir / role]
-            found = None
-            for cand in candidates:
-                if cand.is_file():
-                    found = cand
-                    break
-            if found:
-                file_bytes = found.stat().st_size
-                file_sha256 = sha256_file(found)
+    for role in sorted(KOYAL_REQUIRED_ASSETS.keys()):
+        asset_name = KOYAL_REQUIRED_ASSETS[role]
+        asset_path = found_files[asset_name]
+        file_bytes = asset_path.stat().st_size
+        file_sha256 = sha256_file(asset_path)
 
         files.append({
             "bytes": file_bytes,
@@ -104,11 +101,16 @@ def build_indicconformer_entry(stored_path: Path) -> dict:
     return data
 
 
+def check_is_noop(current_manifest: dict, new_manifest: dict) -> bool:
+    """Check if models.te in new manifest is identical to current manifest."""
+    return current_manifest.get("models", {}).get("te") == new_manifest.get("models", {}).get("te")
+
+
 def validate_sync_manifest_rules(manifest: dict) -> int:
     """
     Re-check all SyncManifest rules:
     - version 1
-    - https only
+    - all model URLs start with REQUIRED_MODEL_URL_PREFIX
     - no path traversal
     - each file <= 400 MB
     - total model files <= 600 MB
@@ -140,8 +142,11 @@ def validate_sync_manifest_rules(manifest: dict) -> int:
                 raise ValueError(f"Empty filename in model {lang}")
             if ".." in fname or "/" in fname or "\\" in fname:
                 raise ValueError(f"Path traversal detected in model {lang} filename: {fname}")
-            if not furl.startswith("https://"):
-                raise ValueError(f"Non-https URL detected in model {lang} ({fname}): {furl}")
+            if not furl.startswith(REQUIRED_MODEL_URL_PREFIX):
+                raise ValueError(
+                    f"Model URL in model {lang} ({fname}) does not start with required prefix "
+                    f"'{REQUIRED_MODEL_URL_PREFIX}': {furl}"
+                )
             if not fsha or len(fsha) != 64:
                 raise ValueError(f"Invalid sha256 in model {lang} ({fname}): {fsha}")
             if fbytes > MAX_FILE_BYTES:
@@ -171,7 +176,7 @@ def build_switch_manifest(
     target: str,
     stored_indicconformer_path: Path,
     draft_dir: Path = None,
-) -> dict:
+) -> tuple:
     """
     Construct new manifest dictionary with switched models.te.
     All other keys stay byte-identical.
@@ -244,7 +249,6 @@ def main():
     # Locate stored indicconformer if path is relative
     stored_path = args.stored_indicconformer
     if not stored_path.is_file():
-        # Try relative to repo root if run from a subdir
         alt = Path(__file__).resolve().parent.parent.parent / "manifests" / "te-indicconformer.json"
         if alt.is_file():
             stored_path = alt
@@ -267,6 +271,14 @@ def main():
     print(f"Total model files size: {total_bytes:,} bytes ({total_mb:.2f} MB / limit 600 MB)")
 
     print_diff(current_text, new_text)
+
+    if check_is_noop(current_manifest, new_manifest):
+        print("No change - nothing to do")
+        if args.out:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(new_text, encoding="utf-8")
+            print(f"Wrote unchanged manifest to {args.out}")
+        return 0
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)

@@ -20,14 +20,13 @@ on:
         default: true
         required: true
 
-permissions:
-  contents: write
-
 jobs:
-  switch:
-    name: "Switch Telugu Model (target: ${{ inputs.target }}, dry_run: ${{ inputs.dry_run }})"
+  plan:
+    name: "Plan switch (target: ${{ inputs.target }}, dry_run: ${{ inputs.dry_run }})"
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout repository
@@ -83,9 +82,121 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p draft_assets
-          gh release download models-2026-10-koyal-te -p "te-koyal__*" -D draft_assets
-          echo "Downloaded draft assets:"
-          ls -la draft_assets/
+          gh release download models-2026-10-koyal-te \
+            -p "te-koyal__model.int8.onnx" \
+            -p "te-koyal__tokens.txt" \
+            -p "te-koyal__model.json" \
+            -p "te-koyal__LICENSE-koyal-te-120m.txt" \
+            -D draft_assets
+
+          echo "Validating downloaded draft assets (exact 4, no unexpected)..."
+          python - <<'PY'
+          import sys
+          from pathlib import Path
+          expected = {
+              "te-koyal__model.int8.onnx",
+              "te-koyal__tokens.txt",
+              "te-koyal__model.json",
+              "te-koyal__LICENSE-koyal-te-120m.txt",
+          }
+          found = {p.name for p in Path("draft_assets").iterdir() if p.is_file()}
+          unexpected = sorted([f for f in found if f.startswith("te-koyal__") and f not in expected])
+          if unexpected:
+              sys.exit(f"Unexpected te-koyal__ assets found in draft: {unexpected}")
+          missing = sorted([f for f in expected if f not in found])
+          if missing:
+              sys.exit(f"Missing required te-koyal__ assets from draft: {missing}")
+          print("Validated exact 4 Koyal draft assets.")
+          PY
+
+      - name: Build new switch manifest and show diff
+        run: |
+          mkdir -p new_rel
+          DRAFT_FLAG=""
+          if [ "${{ inputs.target }}" = "koyal" ]; then
+            DRAFT_FLAG="--draft-dir draft_assets"
+          fi
+          python scripts/switch/build_te_switch.py \
+            --current current_rel/manifest.json \
+            --target "${{ inputs.target }}" \
+            $DRAFT_FLAG \
+            --out new_rel/manifest.json
+
+      - name: Upload plan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: switch-plan
+          path: |
+            current_rel/manifest.json
+            current_rel/manifest.json.sig
+            current_rel/manifest_public_key.b64
+            new_rel/manifest.json
+
+  apply:
+    name: "Apply switch (target: ${{ inputs.target }})"
+    if: inputs.dry_run == false
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install cryptography
+
+      - name: Download current manifest from release models-2026-10
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p current_rel
+          gh release download models-2026-10 \
+            -p "manifest.json" \
+            -p "manifest.json.sig" \
+            -p "manifest_public_key.b64" \
+            -D current_rel
+
+      - name: Download Koyal draft assets if target is koyal
+        if: ${{ inputs.target == 'koyal' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p draft_assets
+          gh release download models-2026-10-koyal-te \
+            -p "te-koyal__model.int8.onnx" \
+            -p "te-koyal__tokens.txt" \
+            -p "te-koyal__model.json" \
+            -p "te-koyal__LICENSE-koyal-te-120m.txt" \
+            -D draft_assets
+
+          python - <<'PY'
+          import sys
+          from pathlib import Path
+          expected = {
+              "te-koyal__model.int8.onnx",
+              "te-koyal__tokens.txt",
+              "te-koyal__model.json",
+              "te-koyal__LICENSE-koyal-te-120m.txt",
+          }
+          found = {p.name for p in Path("draft_assets").iterdir() if p.is_file()}
+          unexpected = sorted([f for f in found if f.startswith("te-koyal__") and f not in expected])
+          if unexpected:
+              sys.exit(f"Unexpected te-koyal__ assets in draft: {unexpected}")
+          missing = sorted([f for f in expected if f not in found])
+          if missing:
+              sys.exit(f"Missing required te-koyal__ assets in draft: {missing}")
+          print("Validated exact 4 Koyal draft assets.")
+          PY
 
       - name: Build new switch manifest
         run: |
@@ -100,25 +211,7 @@ jobs:
             $DRAFT_FLAG \
             --out new_rel/manifest.json
 
-      - name: Handle DRY RUN
-        if: ${{ inputs.dry_run }}
-        run: |
-          echo "================================================================="
-          echo "DRY RUN COMPLETE: Diff and new total logged above."
-          echo "No release assets modified. No signatures published."
-          echo "================================================================="
-
-      - name: Upload dry run artifacts
-        if: ${{ inputs.dry_run }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: dry-run-manifests
-          path: |
-            current_rel/manifest.json
-            new_rel/manifest.json
-
-      - name: Apply switch (DRY RUN = FALSE ONLY)
-        if: ${{ !inputs.dry_run }}
+      - name: Apply switch in safe order
         env:
           GH_TOKEN: ${{ github.token }}
           AARIA_MODELS_SIGNING_KEY: ${{ secrets.AARIA_MODELS_SIGNING_KEY }}
@@ -128,19 +221,106 @@ jobs:
           echo "APPLYING TELEGRAPHED MODEL SWITCH (LIVE UPDATE)"
           echo "================================================================="
 
+          upload_with_retry() {
+            local max_attempts=3
+            local delay=5
+            local attempt=1
+            while [ $attempt -le $max_attempts ]; do
+              echo "Upload attempt $attempt of $max_attempts: gh release upload $@"
+              if gh release upload "$@"; then
+                return 0
+              fi
+              echo "Upload attempt $attempt failed."
+              if [ $attempt -lt $max_attempts ]; then
+                sleep $delay
+              fi
+              attempt=$((attempt + 1))
+            done
+            echo "All $max_attempts upload attempts failed."
+            return 1
+          }
+
+          # 1. No-op detection
+          python - <<'PY'
+          import json, sys
+          from pathlib import Path
+          c = json.loads(Path("current_rel/manifest.json").read_text(encoding="utf-8"))
+          n = json.loads(Path("new_rel/manifest.json").read_text(encoding="utf-8"))
+          if c.get("models", {}).get("te") == n.get("models", {}).get("te"):
+              print("No change - nothing to do")
+              sys.exit(200)
+          PY
+          NOOP_EXIT=$?
+          if [ $NOOP_EXIT -eq 200 ]; then
+            echo "No change detected in models.te. Exiting cleanly without modifying release."
+            exit 0
+          fi
+
           if [ -z "$AARIA_MODELS_SIGNING_KEY" ]; then
             echo "::error::AARIA_MODELS_SIGNING_KEY secret missing. Cannot sign manifest."
             exit 1
           fi
 
-          # (a) For koyal, upload the four te-koyal__ files to release models-2026-10
-          if [ "$TARGET" = "koyal" ]; then
-            echo "Copying te-koyal__ files from draft release to models-2026-10..."
-            gh release upload models-2026-10 draft_assets/te-koyal__* --clobber
+          # 2. Sign new manifest locally
+          echo "Signing new manifest.json locally..."
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from cryptography.hazmat.primitives import hashes, serialization
+          from cryptography.hazmat.primitives.asymmetric import ec
 
-            echo "Re-downloading and verifying uploaded asset sha256..."
+          pem = os.environ["AARIA_MODELS_SIGNING_KEY"].encode()
+          k = serialization.load_pem_private_key(pem, password=None)
+          data = Path("new_rel/manifest.json").read_bytes()
+          sig = k.sign(data, ec.ECDSA(hashes.SHA256()))
+          Path("new_rel/manifest.json.sig").write_bytes(sig)
+          print("Signed new manifest.json successfully.")
+          PY
+
+          # 3. Verify new signature locally with public key BEFORE anything touches live release
+          echo "Verifying new signature locally with manifest_public_key.b64..."
+          python - <<'PY'
+          import base64, sys
+          from pathlib import Path
+          from cryptography.hazmat.primitives import hashes, serialization
+          from cryptography.hazmat.primitives.asymmetric import ec
+
+          manifest_bytes = Path("new_rel/manifest.json").read_bytes()
+          sig_bytes = Path("new_rel/manifest.json.sig").read_bytes()
+          pub_b64 = Path("current_rel/manifest_public_key.b64").read_text().strip()
+
+          pub_der = base64.b64decode(pub_b64)
+          pub_key = serialization.load_der_public_key(pub_der)
+
+          try:
+              pub_key.verify(sig_bytes, manifest_bytes, ec.ECDSA(hashes.SHA256()))
+              print("PRE-UPLOAD LOCAL SIGNATURE VERIFIED: New signature is valid.")
+          except Exception as e:
+              print(f"::error::Pre-upload signature verification failed: {e}", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+          # 4. Only THEN upload Koyal files (if target is koyal)
+          if [ "$TARGET" = "koyal" ]; then
+            echo "Uploading exact 4 Koyal files to models-2026-10..."
+            upload_with_retry models-2026-10 \
+              draft_assets/te-koyal__model.int8.onnx \
+              draft_assets/te-koyal__tokens.txt \
+              draft_assets/te-koyal__model.json \
+              draft_assets/te-koyal__LICENSE-koyal-te-120m.txt \
+              --clobber
+
+            # 5. Re-download Koyal files and check sha256 against new manifest
+            echo "Re-downloading Koyal files and checking sha256..."
             mkdir -p verify_assets
-            gh release download models-2026-10 -p "te-koyal__*" -D verify_assets
+            gh release download models-2026-10 \
+              -p "te-koyal__model.int8.onnx" \
+              -p "te-koyal__tokens.txt" \
+              -p "te-koyal__model.json" \
+              -p "te-koyal__LICENSE-koyal-te-120m.txt" \
+              -D verify_assets \
+              --clobber
+
             python - <<'PY'
             import hashlib, json, sys
             from pathlib import Path
@@ -159,60 +339,24 @@ jobs:
             PY
           fi
 
-          # (b) Sign the new manifest with AARIA_MODELS_SIGNING_KEY (ECDSA P-256 raw DER)
-          echo "Signing new manifest.json with ECDSA P-256/SHA-256..."
-          python - <<'PY'
-          import os
-          from pathlib import Path
-          from cryptography.hazmat.primitives import hashes, serialization
-          from cryptography.hazmat.primitives.asymmetric import ec
-
-          pem = os.environ["AARIA_MODELS_SIGNING_KEY"].encode()
-          k = serialization.load_pem_private_key(pem, password=None)
-          data = Path("new_rel/manifest.json").read_bytes()
-          sig = k.sign(data, ec.ECDSA(hashes.SHA256()))
-          Path("new_rel/manifest.json.sig").write_bytes(sig)
-          print("Signed new manifest.json successfully.")
-          PY
-
-          # (c) Verify new signature with manifest_public_key.b64 BEFORE uploading
-          echo "Verifying new signature against public key..."
-          python - <<'PY'
-          import base64, sys
-          from pathlib import Path
-          from cryptography.hazmat.primitives import hashes, serialization
-          from cryptography.hazmat.primitives.asymmetric import ec
-
-          manifest_bytes = Path("new_rel/manifest.json").read_bytes()
-          sig_bytes = Path("new_rel/manifest.json.sig").read_bytes()
-          pub_b64 = Path("current_rel/manifest_public_key.b64").read_text().strip()
-
-          pub_der = base64.b64decode(pub_b64)
-          pub_key = serialization.load_der_public_key(pub_der)
-
-          try:
-              pub_key.verify(sig_bytes, manifest_bytes, ec.ECDSA(hashes.SHA256()))
-              print("PRE-UPLOAD VERIFICATION PASSED: New signature is valid.")
-          except Exception as e:
-              print(f"::error::Pre-upload signature verification failed: {e}", file=sys.stderr)
-              sys.exit(1)
-          PY
-
-          # (f) Prepare audit copy of previous manifest
+          # 6. Upload manifest-previous.json(.sig)
           cp current_rel/manifest.json new_rel/manifest-previous.json
           cp current_rel/manifest.json.sig new_rel/manifest-previous.json.sig
-
-          # (d) Upload manifest.json and manifest.json.sig together (--clobber), plus previous audit copies
-          echo "Uploading manifest.json and manifest.json.sig to models-2026-10..."
-          gh release upload models-2026-10 \
-            new_rel/manifest.json \
-            new_rel/manifest.json.sig \
+          echo "Uploading manifest-previous.json and manifest-previous.json.sig..."
+          upload_with_retry models-2026-10 \
             new_rel/manifest-previous.json \
             new_rel/manifest-previous.json.sig \
             --clobber
 
-          # (e) Download again from public URL and verify signature + models.te matches target
-          echo "Post-upload verification from public release URL..."
+          # 7. Upload new manifest.json.sig and manifest.json
+          echo "Uploading new manifest.json.sig and manifest.json..."
+          upload_with_retry models-2026-10 \
+            new_rel/manifest.json.sig \
+            new_rel/manifest.json \
+            --clobber
+
+          # 8. Exact after-check: download from public release and verify byte-for-byte equality and signature
+          echo "Performing exact post-upload after-check..."
           mkdir -p post_verify
           gh release download models-2026-10 \
             -p "manifest.json" \
@@ -221,31 +365,107 @@ jobs:
             --clobber
 
           python - <<'PY'
-          import base64, json, os, sys
+          import base64, sys
           from pathlib import Path
           from cryptography.hazmat.primitives import hashes, serialization
           from cryptography.hazmat.primitives.asymmetric import ec
 
-          manifest_bytes = Path("post_verify/manifest.json").read_bytes()
-          sig_bytes = Path("post_verify/manifest.json.sig").read_bytes()
-          pub_b64 = Path("current_rel/manifest_public_key.b64").read_text().strip()
+          downloaded_manifest = Path("post_verify/manifest.json").read_bytes()
+          downloaded_sig = Path("post_verify/manifest.json.sig").read_bytes()
 
+          expected_manifest = Path("new_rel/manifest.json").read_bytes()
+          expected_sig = Path("new_rel/manifest.json.sig").read_bytes()
+
+          # Byte-for-byte equality
+          if downloaded_manifest != expected_manifest:
+              sys.exit("EXACT AFTER-CHECK FAILED: downloaded manifest.json is not byte-for-byte equal to signed manifest!")
+
+          if downloaded_sig != expected_sig:
+              sys.exit("EXACT AFTER-CHECK FAILED: downloaded manifest.json.sig is not byte-for-byte equal to generated signature!")
+
+          print("EXACT AFTER-CHECK PASSED: manifest.json and manifest.json.sig are byte-for-byte identical.")
+
+          # Verify signature
+          pub_b64 = Path("current_rel/manifest_public_key.b64").read_text().strip()
           pub_der = base64.b64decode(pub_b64)
           pub_key = serialization.load_der_public_key(pub_der)
-          pub_key.verify(sig_bytes, manifest_bytes, ec.ECDSA(hashes.SHA256()))
-          print("POST-UPLOAD SIGNATURE VERIFIED: Downloaded manifest.json matches signature.")
 
-          m = json.loads(manifest_bytes.decode("utf-8"))
-          te_files = m.get("models", {}).get("te", {}).get("files", [])
-          target = os.environ["TARGET"]
-          if target == "koyal":
-              assert any("te-koyal__" in f.get("url", "") for f in te_files), "Expected koyal assets in te"
-              print("POST-UPLOAD CONTENT VERIFIED: models.te points to Koyal.")
-          else:
-              assert all("te-koyal__" not in f.get("url", "") for f in te_files), "Expected non-koyal assets in te"
-              print("POST-UPLOAD CONTENT VERIFIED: models.te points to IndicConformer.")
+          try:
+              pub_key.verify(downloaded_sig, downloaded_manifest, ec.ECDSA(hashes.SHA256()))
+              print("POST-UPLOAD SIGNATURE VERIFIED: Downloaded manifest verified with public key.")
+          except Exception as e:
+              sys.exit(f"POST-UPLOAD SIGNATURE VERIFICATION FAILED: {e}")
           PY
 
           echo "================================================================="
           echo "SWITCH SUCCESSFULLY EXECUTED AND VERIFIED."
           echo "================================================================="
+
+      - name: Rollback on failure
+        if: failure() && inputs.dry_run == false
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "================================================================="
+          echo "FAILURE DETECTED: EXECUTING AUTOMATIC ROLLBACK TO PREVIOUS MANIFEST"
+          echo "================================================================="
+
+          upload_with_retry() {
+            local max_attempts=3
+            local delay=5
+            local attempt=1
+            while [ $attempt -le $max_attempts ]; do
+              echo "Rollback upload attempt $attempt of $max_attempts: gh release upload $@"
+              if gh release upload "$@"; then
+                return 0
+              fi
+              echo "Upload attempt $attempt failed."
+              if [ $attempt -lt $max_attempts ]; then
+                sleep $delay
+              fi
+              attempt=$((attempt + 1))
+            done
+            echo "All $max_attempts rollback upload attempts failed."
+            return 1
+          }
+
+          if [ -f "current_rel/manifest.json" ] && [ -f "current_rel/manifest.json.sig" ]; then
+            echo "Re-uploading previous manifest.json and manifest.json.sig..."
+            upload_with_retry models-2026-10 \
+              current_rel/manifest.json \
+              current_rel/manifest.json.sig \
+              --clobber
+
+            mkdir -p rollback_verify
+            gh release download models-2026-10 \
+              -p "manifest.json" \
+              -p "manifest.json.sig" \
+              -D rollback_verify \
+              --clobber
+
+            python - <<'PY'
+            import base64, sys
+            from pathlib import Path
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import ec
+
+            manifest_bytes = Path("rollback_verify/manifest.json").read_bytes()
+            sig_bytes = Path("rollback_verify/manifest.json.sig").read_bytes()
+            pub_b64 = Path("current_rel/manifest_public_key.b64").read_text().strip()
+
+            pub_der = base64.b64decode(pub_b64)
+            pub_key = serialization.load_der_public_key(pub_der)
+
+            try:
+                pub_key.verify(sig_bytes, manifest_bytes, ec.ECDSA(hashes.SHA256()))
+                print("Rollback manifest signature verified successfully.")
+            except Exception as e:
+                print(f"::error::Rollback signature verification failed: {e}", file=sys.stderr)
+                sys.exit(1)
+            PY
+
+            echo "ROLLED BACK to previous manifest"
+          else
+            echo "::error::Cannot rollback: saved previous manifest files not found in current_rel/"
+            exit 1
+          fi

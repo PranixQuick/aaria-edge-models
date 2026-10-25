@@ -3,20 +3,28 @@
 Unit tests for the Telugu model switch logic (runs locally).
 
 Tests:
-1. Koyal build: models.te points to Koyal, non-target languages unchanged byte-for-byte.
+1. Koyal build: models.te points to Koyal, exact four files, non-target languages unchanged byte-for-byte.
 2. IndicConformer build: models.te matches stored byte-for-byte, non-target languages unchanged.
 3. Stored IndicConformer matches live manifest models.te (skips gracefully if offline).
 4. Limit enforcement: fake 700 MB total fails, fake 450 MB single file fails.
-5. Security rules: http URL fails, path traversal ../ fails, version != 1 fails.
+5. Security rules: http URL fails, URL prefix rule enforced, path traversal ../ fails, version != 1 fails.
 6. Signature round-trip test using a THROWAWAY key generated in-memory.
-7. Python compilation on all new scripts (score_onnx.py, build_te_switch.py, test_switch.py).
-8. YAML parsing on both workflows (te-compare.yml, te-switch.yml):
-   workflow_dispatch only, dry_run defaults to true.
+7. Python compilation on all scripts.
+8. YAML parsing and security assertions on workflows (te-compare.yml, te-switch.yml):
+   - te-switch.yml: workflow_dispatch only, dry_run defaults to true.
+   - plan job has read-only permission (contents: read) and NO secrets.
+   - apply job has if: inputs.dry_run == false and contents: write.
+   - failure()-rollback step exists in apply job.
+9. No-op detection: switching to target while already on target returns is_noop=True.
+10. Exact four-file draft checking: missing file fails, extra te-koyal__ file fails.
+11. score_onnx.py manifest validation: missing model.int8.onnx or tokens.txt fails (not skip).
 """
 
+import copy
 import json
 import os
 import py_compile
+import shutil
 import sys
 import tempfile
 import urllib.request
@@ -27,6 +35,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "switch"))
 import build_te_switch
+
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "koyal_te"))
+import score_onnx
 
 
 MOCK_MANIFEST = {
@@ -95,42 +106,64 @@ MOCK_MANIFEST = {
 }
 
 
+def _create_mock_draft_dir(tmp_path: Path, extra_file: bool = False, missing_file: bool = False):
+    """Helper to populate mock draft directory with exact Koyal files."""
+    d = tmp_path / "draft"
+    d.mkdir(parents=True, exist_ok=True)
+    files = {
+        "te-koyal__model.int8.onnx": b"fake_onnx_bytes" * 1000,
+        "te-koyal__tokens.txt": b"fake_tokens",
+        "te-koyal__model.json": b'{"type":"ctc"}',
+        "te-koyal__LICENSE-koyal-te-120m.txt": b"license text",
+    }
+    if missing_file:
+        del files["te-koyal__LICENSE-koyal-te-120m.txt"]
+    for fname, data in files.items():
+        (d / fname).write_bytes(data)
+    if extra_file:
+        (d / "te-koyal__unexpected.bin").write_bytes(b"extra")
+    return d
+
+
 def test_koyal_and_indicconformer_builds():
     print("Testing Koyal and IndicConformer switch builds...")
     stored_path = REPO_ROOT / "manifests" / "te-indicconformer.json"
     assert stored_path.is_file(), f"Missing stored indicconformer file: {stored_path}"
 
-    # 1. Koyal build
-    koyal_manifest, koyal_bytes = build_te_switch.build_switch_manifest(
-        MOCK_MANIFEST, "koyal", stored_path
-    )
-    assert koyal_manifest["models"]["te"]["type"] == "ctc"
-    te_files = koyal_manifest["models"]["te"]["files"]
-    assert len(te_files) == 4
-    file_names = [f["name"] for f in te_files]
-    assert file_names == ["LICENSE", "model.int8.onnx", "model.json", "tokens.txt"]
-    assert all("te-koyal__" in f["url"] for f in te_files)
-    assert all(f["url"].startswith("https://") for f in te_files)
+    with tempfile.TemporaryDirectory() as td:
+        draft_dir = _create_mock_draft_dir(Path(td))
 
-    # Verify other languages and keys unchanged byte-for-byte
-    assert koyal_manifest["version"] == MOCK_MANIFEST["version"]
-    assert koyal_manifest["release"] == MOCK_MANIFEST["release"]
-    assert koyal_manifest["models"]["en"] == MOCK_MANIFEST["models"]["en"]
-    assert koyal_manifest["models"]["hi"] == MOCK_MANIFEST["models"]["hi"]
-    assert koyal_manifest["replies"] == MOCK_MANIFEST["replies"]
-    print("  -> Koyal build verified and other languages byte-identical!")
+        # 1. Koyal build
+        koyal_manifest, koyal_bytes = build_te_switch.build_switch_manifest(
+            MOCK_MANIFEST, "koyal", stored_path, draft_dir=draft_dir
+        )
+        assert koyal_manifest["models"]["te"]["type"] == "ctc"
+        te_files = koyal_manifest["models"]["te"]["files"]
+        assert len(te_files) == 4
+        file_names = [f["name"] for f in te_files]
+        assert file_names == ["LICENSE", "model.int8.onnx", "model.json", "tokens.txt"]
+        assert all("te-koyal__" in f["url"] for f in te_files)
+        assert all(f["url"].startswith("https://github.com/PranixQuick/aaria-edge-models/releases/download/models-2026-10/") for f in te_files)
 
-    # 2. IndicConformer build
-    indic_manifest, indic_bytes = build_te_switch.build_switch_manifest(
-        MOCK_MANIFEST, "indicconformer", stored_path
-    )
-    assert indic_manifest["models"]["te"]["type"] == "ctc"
-    stored_te = json.loads(stored_path.read_text(encoding="utf-8"))
-    assert indic_manifest["models"]["te"] == stored_te
-    assert indic_manifest["models"]["en"] == MOCK_MANIFEST["models"]["en"]
-    assert indic_manifest["models"]["hi"] == MOCK_MANIFEST["models"]["hi"]
-    assert indic_manifest["replies"] == MOCK_MANIFEST["replies"]
-    print("  -> IndicConformer build verified byte-for-byte against stored entry!")
+        # Verify other languages and keys unchanged byte-for-byte
+        assert koyal_manifest["version"] == MOCK_MANIFEST["version"]
+        assert koyal_manifest["release"] == MOCK_MANIFEST["release"]
+        assert koyal_manifest["models"]["en"] == MOCK_MANIFEST["models"]["en"]
+        assert koyal_manifest["models"]["hi"] == MOCK_MANIFEST["models"]["hi"]
+        assert koyal_manifest["replies"] == MOCK_MANIFEST["replies"]
+        print("  -> Koyal build verified and other languages byte-identical!")
+
+        # 2. IndicConformer build
+        indic_manifest, indic_bytes = build_te_switch.build_switch_manifest(
+            MOCK_MANIFEST, "indicconformer", stored_path
+        )
+        assert indic_manifest["models"]["te"]["type"] == "ctc"
+        stored_te = json.loads(stored_path.read_text(encoding="utf-8"))
+        assert indic_manifest["models"]["te"] == stored_te
+        assert indic_manifest["models"]["en"] == MOCK_MANIFEST["models"]["en"]
+        assert indic_manifest["models"]["hi"] == MOCK_MANIFEST["models"]["hi"]
+        assert indic_manifest["replies"] == MOCK_MANIFEST["replies"]
+        print("  -> IndicConformer build verified byte-for-byte against stored entry!")
 
 
 def test_live_indicconformer_matches_stored():
@@ -155,8 +188,6 @@ def test_live_indicconformer_matches_stored():
 
 def test_size_limits_enforced():
     print("Testing 600 MB total and 400 MB per-file limits...")
-    import copy
-
     # Fake 700 MB total: single model with 700 MB
     bad_manifest = copy.deepcopy(MOCK_MANIFEST)
     bad_manifest["models"]["en"]["files"][0]["bytes"] = 700 * 1024 * 1024
@@ -170,7 +201,7 @@ def test_size_limits_enforced():
     # Fake total > 600 MB across multiple valid files (< 400 MB each)
     bad_manifest2 = copy.deepcopy(MOCK_MANIFEST)
     bad_manifest2["models"]["en"]["files"][0]["bytes"] = 350 * 1024 * 1024
-    bad_manifest2["models"]["hi"]["files"][0]["bytes"] = 350 * 1024 * 1024  # Total = 700 MB + te
+    bad_manifest2["models"]["hi"]["files"][0]["bytes"] = 350 * 1024 * 1024
     try:
         build_te_switch.validate_sync_manifest_rules(bad_manifest2)
         assert False, "Expected ValueError for > 600 MB total"
@@ -180,18 +211,26 @@ def test_size_limits_enforced():
 
 
 def test_security_rules_enforced():
-    print("Testing security rules (http URL, path traversal, version)...")
-    import copy
-
+    print("Testing security rules (http URL, URL prefix, path traversal, version)...")
     # HTTP URL
     bad_manifest_http = copy.deepcopy(MOCK_MANIFEST)
-    bad_manifest_http["models"]["en"]["files"][0]["url"] = "http://example.com/model.onnx"
+    bad_manifest_http["models"]["en"]["files"][0]["url"] = "http://github.com/PranixQuick/aaria-edge-models/releases/download/models-2026-10/model.onnx"
     try:
         build_te_switch.validate_sync_manifest_rules(bad_manifest_http)
         assert False, "Expected ValueError for http URL"
     except ValueError as e:
-        assert "https" in str(e).lower()
+        assert "prefix" in str(e).lower() or "https" in str(e).lower()
         print(f"  -> http URL violation caught: {e}")
+
+    # URL prefix mismatch
+    bad_manifest_prefix = copy.deepcopy(MOCK_MANIFEST)
+    bad_manifest_prefix["models"]["en"]["files"][0]["url"] = "https://malicious.example.com/models-2026-10/model.onnx"
+    try:
+        build_te_switch.validate_sync_manifest_rules(bad_manifest_prefix)
+        assert False, "Expected ValueError for URL prefix mismatch"
+    except ValueError as e:
+        assert "required prefix" in str(e).lower()
+        print(f"  -> URL prefix mismatch caught: {e}")
 
     # Path traversal ../
     bad_manifest_trav = copy.deepcopy(MOCK_MANIFEST)
@@ -214,29 +253,73 @@ def test_security_rules_enforced():
         print(f"  -> version != 1 caught: {e}")
 
 
+def test_noop_detection():
+    print("Testing no-op detection...")
+    stored_path = REPO_ROOT / "manifests" / "te-indicconformer.json"
+    # When current manifest has IndicConformer and target is indicconformer -> is_noop is True
+    indic_manifest, _ = build_te_switch.build_switch_manifest(MOCK_MANIFEST, "indicconformer", stored_path)
+    assert build_te_switch.check_is_noop(MOCK_MANIFEST, indic_manifest) is True, "Expected no-op for indicconformer on indicconformer"
+
+    with tempfile.TemporaryDirectory() as td:
+        draft_dir = _create_mock_draft_dir(Path(td))
+        koyal_manifest, _ = build_te_switch.build_switch_manifest(MOCK_MANIFEST, "koyal", stored_path, draft_dir=draft_dir)
+        assert build_te_switch.check_is_noop(MOCK_MANIFEST, koyal_manifest) is False, "Expected change for koyal on indicconformer"
+
+        # Switching to koyal when already on koyal -> is_noop is True
+        koyal_manifest_2, _ = build_te_switch.build_switch_manifest(koyal_manifest, "koyal", stored_path, draft_dir=draft_dir)
+        assert build_te_switch.check_is_noop(koyal_manifest, koyal_manifest_2) is True, "Expected no-op for koyal on koyal"
+    print("  -> No-op detection verified!")
+
+
+def test_exact_four_file_list_enforced():
+    print("Testing exact four-file Koyal draft enforcement (missing/extra files fail)...")
+    stored_path = REPO_ROOT / "manifests" / "te-indicconformer.json"
+
+    # Missing draft_dir entirely
+    try:
+        build_te_switch.build_switch_manifest(MOCK_MANIFEST, "koyal", stored_path, draft_dir=None)
+        assert False, "Expected FileNotFoundError for None draft_dir"
+    except FileNotFoundError as e:
+        print(f"  -> Missing draft_dir caught: {e}")
+
+    with tempfile.TemporaryDirectory() as td:
+        # Missing file in draft_dir
+        missing_dir = _create_mock_draft_dir(Path(td) / "missing", missing_file=True)
+        try:
+            build_te_switch.build_switch_manifest(MOCK_MANIFEST, "koyal", stored_path, draft_dir=missing_dir)
+            assert False, "Expected FileNotFoundError for missing draft asset"
+        except FileNotFoundError as e:
+            assert "Missing required" in str(e)
+            print(f"  -> Missing draft asset caught: {e}")
+
+        # Extra te-koyal__ file in draft_dir
+        extra_dir = _create_mock_draft_dir(Path(td) / "extra", extra_file=True)
+        try:
+            build_te_switch.build_switch_manifest(MOCK_MANIFEST, "koyal", stored_path, draft_dir=extra_dir)
+            assert False, "Expected ValueError for unexpected te-koyal__ asset"
+        except ValueError as e:
+            assert "Unexpected te-koyal__" in str(e)
+            print(f"  -> Unexpected te-koyal__ asset caught: {e}")
+
+
 def test_signature_roundtrip_throwaway_key():
     print("Testing signature round-trip with a THROWAWAY key generated in memory...")
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec
 
-    # Generate a fresh ephemeral throwaway key
     throwaway_key = ec.generate_private_key(ec.SECP256R1())
     manifest_data = json.dumps(MOCK_MANIFEST, sort_keys=True).encode("utf-8")
 
-    # Sign data (ECDSA P-256 over SHA-256, raw DER)
     sig = throwaway_key.sign(manifest_data, ec.ECDSA(hashes.SHA256()))
     assert len(sig) > 0
 
-    # Extract public key as DER SubjectPublicKeyInfo
     pub_der = throwaway_key.public_key().public_bytes(
         serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
     )
     pub_key = serialization.load_der_public_key(pub_der)
 
-    # Verify signature
     pub_key.verify(sig, manifest_data, ec.ECDSA(hashes.SHA256()))
 
-    # Verify tampered payload fails
     tampered_data = manifest_data + b" "
     try:
         pub_key.verify(sig, tampered_data, ec.ECDSA(hashes.SHA256()))
@@ -244,6 +327,54 @@ def test_signature_roundtrip_throwaway_key():
     except Exception:
         pass
     print("  -> Signature round-trip with throwaway key passed (tamper detection verified)!")
+
+
+def test_score_onnx_manifest_checks():
+    print("Testing score_onnx.py verify_against_manifest failure when model or tokens missing...")
+    with tempfile.TemporaryDirectory() as td:
+        tpath = Path(td)
+        m_file = tpath / "manifest.json"
+        model_p = tpath / "model.int8.onnx"
+        tokens_p = tpath / "tokens.txt"
+        model_p.write_bytes(b"model_bytes")
+        tokens_p.write_bytes(b"tokens_bytes")
+
+        # Incomplete manifest missing tokens.txt
+        bad_m = {
+            "models": {
+                "te": {
+                    "files": [
+                        {"name": "model.int8.onnx", "sha256": score_onnx.sha256_file(model_p)}
+                    ]
+                }
+            }
+        }
+        m_file.write_text(json.dumps(bad_m), encoding="utf-8")
+
+        try:
+            score_onnx.verify_against_manifest(m_file, model_p, tokens_p)
+            assert False, "Expected ValueError when tokens.txt missing from manifest"
+        except ValueError as e:
+            assert "does not list 'tokens.txt'" in str(e)
+            print(f"  -> Missing tokens.txt in manifest correctly caught: {e}")
+
+        # Incomplete manifest missing model.int8.onnx
+        bad_m2 = {
+            "models": {
+                "te": {
+                    "files": [
+                        {"name": "tokens.txt", "sha256": score_onnx.sha256_file(tokens_p)}
+                    ]
+                }
+            }
+        }
+        m_file.write_text(json.dumps(bad_m2), encoding="utf-8")
+        try:
+            score_onnx.verify_against_manifest(m_file, model_p, tokens_p)
+            assert False, "Expected ValueError when model.int8.onnx missing from manifest"
+        except ValueError as e:
+            assert "does not list 'model.int8.onnx'" in str(e)
+            print(f"  -> Missing model.int8.onnx in manifest correctly caught: {e}")
 
 
 def test_py_compile_new_scripts():
@@ -262,7 +393,6 @@ def test_py_compile_new_scripts():
 def _get_yaml_triggers(yaml_data):
     if not yaml_data:
         return []
-    # In YAML 1.1 unquoted 'on' is parsed as boolean True
     triggers = yaml_data.get("on") if "on" in yaml_data else yaml_data.get(True)
     if isinstance(triggers, str):
         return [triggers]
@@ -274,7 +404,7 @@ def _get_yaml_triggers(yaml_data):
 
 
 def test_workflows_yaml():
-    print("Testing workflows YAML syntax and dispatch constraints...")
+    print("Testing workflows YAML syntax and security constraints...")
     import yaml
 
     workflows_dir = REPO_ROOT / ".github" / "workflows"
@@ -293,7 +423,8 @@ def test_workflows_yaml():
     print("  -> te-compare.yml is workflow_dispatch only!")
 
     # Parse te-switch.yml
-    s_data = yaml.safe_load(switch_yml.read_text(encoding="utf-8"))
+    switch_raw = switch_yml.read_text(encoding="utf-8")
+    s_data = yaml.safe_load(switch_raw)
     s_triggers = _get_yaml_triggers(s_data)
     assert s_triggers == ["workflow_dispatch"], (
         f"te-switch.yml must be workflow_dispatch only, found: {s_triggers}"
@@ -307,13 +438,59 @@ def test_workflows_yaml():
     assert dry_run_default is True, f"te-switch.yml dry_run default must be true, got {dry_run_default}"
     print("  -> te-switch.yml is workflow_dispatch only and dry_run defaults to true!")
 
+    # Permissions split and job structure tests
+    jobs = s_data.get("jobs", {})
+    assert "plan" in jobs, "te-switch.yml must contain 'plan' job"
+    assert "apply" in jobs, "te-switch.yml must contain 'apply' job"
+
+    plan_job = jobs["plan"]
+    plan_perms = plan_job.get("permissions", {})
+    assert plan_perms == {"contents": "read"} or plan_perms.get("contents") == "read", (
+        f"plan job must have permissions: contents: read, got {plan_perms}"
+    )
+    # Ensure plan job does not access signing secret
+    plan_str = json.dumps(plan_job)
+    assert "AARIA_MODELS_SIGNING_KEY" not in plan_str, (
+        "plan job must NEVER access AARIA_MODELS_SIGNING_KEY secret"
+    )
+    print("  -> plan job has contents: read and no signing secret!")
+
+    apply_job = jobs["apply"]
+    apply_if = apply_job.get("if", "")
+    assert "inputs.dry_run == false" in str(apply_if) or "!inputs.dry_run" in str(apply_if), (
+        f"apply job must have if: inputs.dry_run == false, got: {apply_if}"
+    )
+    apply_perms = apply_job.get("permissions", {})
+    assert apply_perms == {"contents": "write"} or apply_perms.get("contents") == "write", (
+        f"apply job must have permissions: contents: write, got {apply_perms}"
+    )
+    print("  -> apply job requires dry_run == false and contents: write!")
+
+    # Check rollback step exists in apply job
+    apply_steps = apply_job.get("steps", [])
+    rollback_step = None
+    for step in apply_steps:
+        step_if = str(step.get("if", ""))
+        if "failure()" in step_if:
+            rollback_step = step
+            break
+    assert rollback_step is not None, "apply job must contain a rollback step with if: failure()"
+    rollback_if = str(rollback_step.get("if", ""))
+    assert "inputs.dry_run == false" in rollback_if or "!inputs.dry_run" in rollback_if, (
+        f"Rollback step must check inputs.dry_run == false, got: {rollback_if}"
+    )
+    print("  -> failure()-rollback step verified in apply job!")
+
 
 if __name__ == "__main__":
     test_koyal_and_indicconformer_builds()
     test_live_indicconformer_matches_stored()
     test_size_limits_enforced()
     test_security_rules_enforced()
+    test_noop_detection()
+    test_exact_four_file_list_enforced()
     test_signature_roundtrip_throwaway_key()
+    test_score_onnx_manifest_checks()
     test_py_compile_new_scripts()
     test_workflows_yaml()
     print("\nALL SWITCH UNIT CHECKS PASSED.")

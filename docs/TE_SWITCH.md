@@ -40,58 +40,61 @@ The switch workflow is manual-only (`workflow_dispatch`) with two inputs:
 - `target`: `koyal` or `indicconformer` (required)
 - `dry_run`: boolean, **default `true`**
 
-### 1. Dry Run (Default)
-When `dry_run: true`:
-- Downloads current `manifest.json`, `.sig`, and public key from `models-2026-10`.
-- Verifies current release signature.
-- Downloads Koyal draft assets (if `target=koyal`).
-- Computes new manifest, enforces all SyncManifest rules, and logs a unified diff and total byte footprint.
-- Uploads both current and proposed manifests as workflow artifacts.
-- **Modifies nothing in releases or on phones.**
+### Two-Job Permissions Architecture
 
-### 2. Switching to Koyal
-To switch QuietKeep phones to Koyal te-120M:
-1. Navigate to Actions -> `te-switch`.
-2. Select `target: koyal`.
-3. Set `dry_run: false`.
-4. Trigger workflow.
+To protect production release assets and secrets, the workflow is split into two distinct jobs:
 
-Workflow actions:
-- Copies `te-koyal__*` assets from draft release `models-2026-10-koyal-te` into published release `models-2026-10` (`--clobber` only on `te-koyal__*` names; never touches existing assets).
-- Re-downloads and verifies SHA-256 of uploaded assets.
-- Signs new `manifest.json` using repository secret `AARIA_MODELS_SIGNING_KEY` (ECDSA P-256 / SHA-256 raw DER).
-- Validates signature with public key before publishing.
-- Uploads `manifest.json` and `manifest.json.sig` together to `models-2026-10`.
-- Preserves audit copy as `manifest-previous.json` and `manifest-previous.json.sig`.
-- Re-downloads from public URL to verify end-to-end integrity.
+1. **`plan` job**:
+   - Runs on every invocation (both dry-run and live).
+   - Restricted to read-only permissions (`permissions: contents: read`).
+   - Has **zero access** to repository signing secrets (`AARIA_MODELS_SIGNING_KEY` is never provided).
+   - Downloads current manifest, verifies current signature, downloads Koyal draft files, builds the proposed manifest, enforces all SyncManifest limits, prints the unified diff, and uploads plan artifacts.
 
-Phones pick up Koyal at their next nightly sync over Wi-Fi.
+2. **`apply` job**:
+   - Strictly gated to `if: inputs.dry_run == false`.
+   - Requires explicit elevation (`permissions: contents: write`) and accesses `AARIA_MODELS_SIGNING_KEY`.
+   - Never runs during dry runs.
 
-### 3. Switching Back to IndicConformer (Reversion)
-To revert to the original IndicConformer:
-1. Navigate to Actions -> `te-switch`.
-2. Select `target: indicconformer`.
-3. Set `dry_run: false`.
-4. Trigger workflow.
+---
 
-The workflow restores `models.te` from the committed, byte-for-byte baseline `manifests/te-indicconformer.json`, signs the manifest, and publishes it.
+## Safe Execution Order & Rollback on Failure
+
+When `dry_run: false`, the `apply` job executes a fail-safe, atomic sequence:
+
+1. **No-op Detection**: If `models.te` in the proposed manifest equals the current release manifest, the workflow prints `No change - nothing to do` and exits cleanly with code 0 without touching any assets or re-signing anything.
+2. **Local Signing & Verification**: The new manifest is signed locally with ECDSA P-256, and immediately verified against the release public key (`manifest_public_key.b64`). **Nothing touches the live release before this local signature check passes.**
+3. **Exact Asset Upload & SHA Verification**: Exactly four Koyal files (`te-koyal__model.int8.onnx`, `te-koyal__tokens.txt`, `te-koyal__model.json`, `te-koyal__LICENSE-koyal-te-120m.txt`) are uploaded with 3-attempt exponential retries. They are immediately re-downloaded from the release and their SHA-256 checksums verified against the new manifest.
+4. **Audit Backup**: Current `manifest.json` and `.sig` are archived as `manifest-previous.json` and `manifest-previous.json.sig` on the release.
+5. **Manifest Atomic Update**: New `manifest.json.sig` and `manifest.json` are uploaded together (--clobber) with retries.
+6. **Exact After-Check**: The workflow downloads `manifest.json` and `manifest.json.sig` from the public release URL and requires **exact byte-for-byte equality** with the locally signed manifest and signature, plus a passing cryptographic verification.
+
+### Automatic Rollback on Failure
+If any failure occurs during the live apply step (network disruption, upload failure, or verification mismatch), the final step triggers automatically (`if: failure() && inputs.dry_run == false`):
+- Re-uploads the saved previous `manifest.json` and `manifest.json.sig` using retries.
+- Re-downloads and cryptographically verifies the restored signature.
+- Logs clearly: `ROLLED BACK to previous manifest`.
+
+---
+
+## Phone Sync Safety Window
+
+QuietKeep edge devices download both `manifest.json` and `manifest.json.sig` simultaneously during sync and verify:
+1. The ECDSA P-256 signature against the pinned public key.
+2. The SHA-256 checksum of every downloaded asset against the manifest.
+
+If a phone happens to query the release during the few-second swap window:
+- If it sees a signature mismatch or an asset that has not finished uploading, the phone's sync client safely **rejects the manifest update**.
+- The phone remains on its currently installed, fully verified model and functions normally.
+- The phone simply retries at its next scheduled sync cycle.
 
 ---
 
 ## SyncManifest Security & Constraint Rules
 
 The builder script (`scripts/switch/build_te_switch.py`) strictly enforces:
-- **Protocol**: `https://` only for all asset URLs.
+- **URL Prefix**: Every model URL must start with `https://github.com/PranixQuick/aaria-edge-models/releases/download/models-2026-10/`.
 - **Path Traversal**: Filenames must not contain `..`, `/`, or `\\`.
 - **Per-file limit**: Maximum 400 MB per single file (largest model file is ~138 MB).
 - **Total model limit**: Sum of all model files across all languages must stay <= 600 MB (current total with Koyal: ~489 MB).
 - **Version**: `version: 1`.
 - **Integrity**: Every non-target key (`en`, `hi`, `replies`) remains byte-identical.
-
----
-
-## Governance & Product Decision
-
-Turning the switch on (`dry_run: false`) is the founder's product decision, to be made after:
-1. Reviewing the same-test comparative evaluation results from `te-compare.yml` (Kathbath Telugu 60 clips).
-2. Reviewing mixed-recording real-world evaluation clips.
