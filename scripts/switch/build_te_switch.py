@@ -12,13 +12,16 @@ Enforces all SyncManifest rules:
 - All non-target languages (en, hi) and replies stay byte-identical
 
 Prints total model size and unified diff against current manifest.
-Detects no-op changes (prints "No change - nothing to do" and exits 0).
+Outputs noop=true|false and manifest_sha256 to $GITHUB_OUTPUT.
+Writes manifest.json and manifest.json.sha256 companion file.
+Always exits 0 on success (no non-zero exit for no-op).
 """
 
 import argparse
 import difflib
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -140,7 +143,7 @@ def validate_sync_manifest_rules(manifest: dict) -> int:
 
             if not fname:
                 raise ValueError(f"Empty filename in model {lang}")
-            if ".." in fname or "/" in fname or "\\" in fname:
+            if ".." in fname or "/" in fname or chr(92) in fname:
                 raise ValueError(f"Path traversal detected in model {lang} filename: {fname}")
             if not furl.startswith(REQUIRED_MODEL_URL_PREFIX):
                 raise ValueError(
@@ -225,6 +228,18 @@ def print_diff(current_json_str: str, new_json_str: str):
     print("=====================\n")
 
 
+def write_github_output(noop: bool, sha256_str: str):
+    """Write noop and manifest_sha256 to $GITHUB_OUTPUT if present."""
+    gh_output = os.environ.get("GITHUB_OUTPUT")
+    if gh_output:
+        try:
+            with open(gh_output, "a", encoding="utf-8") as f:
+                f.write(f"noop={'true' if noop else 'false'}\n")
+                f.write(f"manifest_sha256={sha256_str}\n")
+        except Exception as e:
+            print(f"::warning::Failed to write to GITHUB_OUTPUT: {e}", file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--current", required=True, type=Path, help="Path to current manifest.json")
@@ -265,25 +280,32 @@ def main():
         sys.exit(1)
 
     new_text = json.dumps(new_manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    new_bytes = new_text.encode("utf-8")
+    new_sha256 = hashlib.sha256(new_bytes).hexdigest()
 
     total_mb = total_bytes / (1024 * 1024)
     print(f"Target model switch: {args.target}")
     print(f"Total model files size: {total_bytes:,} bytes ({total_mb:.2f} MB / limit 600 MB)")
+    print(f"Built manifest SHA-256: {new_sha256}")
 
     print_diff(current_text, new_text)
 
-    if check_is_noop(current_manifest, new_manifest):
-        print("No change - nothing to do")
-        if args.out:
-            args.out.parent.mkdir(parents=True, exist_ok=True)
-            args.out.write_text(new_text, encoding="utf-8")
-            print(f"Wrote unchanged manifest to {args.out}")
-        return 0
+    is_noop = check_is_noop(current_manifest, new_manifest)
 
+    # Write output manifest and companion .sha256 file
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(new_text, encoding="utf-8")
-        print(f"Wrote new manifest to {args.out}")
+        args.out.write_bytes(new_bytes)
+        sha_file = args.out.parent / f"{args.out.name}.sha256"
+        sha_file.write_text(f"{new_sha256}  {args.out.name}\n", encoding="utf-8")
+        print(f"Wrote manifest to {args.out}")
+        print(f"Wrote manifest digest to {sha_file}")
+
+    write_github_output(is_noop, new_sha256)
+
+    if is_noop:
+        print("No change - nothing to do")
+        return 0
 
     return 0
 
