@@ -229,7 +229,7 @@ def print_diff(current_json_str: str, new_json_str: str):
 
 
 def write_github_output(noop: bool, sha256_str: str):
-    """Write noop and manifest_sha256 to $GITHUB_OUTPUT if present."""
+    """Write noop and manifest_sha256 to $GITHUB_OUTPUT if present. Failing to write is FATAL."""
     gh_output = os.environ.get("GITHUB_OUTPUT")
     if gh_output:
         try:
@@ -237,7 +237,8 @@ def write_github_output(noop: bool, sha256_str: str):
                 f.write(f"noop={'true' if noop else 'false'}\n")
                 f.write(f"manifest_sha256={sha256_str}\n")
         except Exception as e:
-            print(f"::warning::Failed to write to GITHUB_OUTPUT: {e}", file=sys.stderr)
+            print(f"::error::Failed to write to GITHUB_OUTPUT: {e}", file=sys.stderr)
+            sys.exit(1)
 
 
 def main():
