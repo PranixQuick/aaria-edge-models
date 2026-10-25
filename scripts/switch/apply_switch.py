@@ -4,7 +4,7 @@ Apply the Telugu model switch safely to release models-2026-10.
 
 Order of operations:
 1. Plan hand-off verification: validates plan artifact manifest exists and matches expected SHA-256.
-   Apply NEVER rebuilds the manifest.
+   --expected-sha256 is REQUIRED and non-empty. Apply NEVER rebuilds the manifest.
 2. No-op verification: checks if models.te is already identical; if so, exits 0 cleanly.
 3. Local signing: signs the plan manifest locally with AARIA_MODELS_SIGNING_KEY (ECDSA P-256 SHA-256).
    Never logs or prints secrets.
@@ -16,12 +16,15 @@ Order of operations:
    - If it exists and SHA-256 differs: FAILS before touching anything!
    - Uploads new assets without --clobber.
    - Re-downloads all 4 Koyal assets from release and verifies SHA-256 matches manifest.
-6. Timestamped previous manifest upload:
+6. Race guard:
+   - Downloads live manifest.json again immediately before uploading new manifest.
+   - Requires byte-identical equality to current_rel/manifest.json. Stops without uploading on mismatch.
+7. Timestamped previous manifest upload:
    - Uploads manifest-previous-<UTC timestamp>.json and manifest-previous-<UTC timestamp>.json.sig
    - Never clobbers old ones (preserves immutable audit history).
-7. Live manifest update:
+8. Live manifest update:
    - Uploads new manifest.json.sig and manifest.json with --clobber.
-8. Exact post-upload after-check:
+9. Exact post-upload after-check:
    - Downloads live manifest.json and manifest.json.sig.
    - Asserts byte-for-byte equality with local signed manifest.
    - Verifies signature using release public key.
@@ -105,21 +108,61 @@ def verify_signature(manifest_bytes: bytes, sig_bytes: bytes, pubkey_b64: str) -
     pub_key.verify(sig_bytes, manifest_bytes, ec.ECDSA(hashes.SHA256()))
 
 
-def main():
+def check_live_manifest_race(release: str, current_dir: Path, check_dir: Path = None) -> bool:
+    """
+    Download live manifest.json again and require it to be byte-identical
+    to current_dir / manifest.json.
+    Returns True if identical, False if mismatch or download failed.
+    """
+    if check_dir is None:
+        check_dir = Path("race_check")
+    check_dir.mkdir(parents=True, exist_ok=True)
+    dl = subprocess.run(
+        ["gh", "release", "download", release, "-p", "manifest.json", "-D", str(check_dir), "--clobber"],
+        capture_output=True,
+        text=True,
+    )
+    if dl.returncode != 0:
+        print(f"::error::Failed to download live manifest for race check: {dl.stderr}", file=sys.stderr)
+        return False
+
+    live_path = check_dir / "manifest.json"
+    baseline_path = current_dir / "manifest.json"
+    if not live_path.is_file() or not baseline_path.is_file():
+        print(f"::error::Race check file missing: live={live_path.is_file()}, baseline={baseline_path.is_file()}", file=sys.stderr)
+        return False
+
+    if live_path.read_bytes() != baseline_path.read_bytes():
+        print(
+            "::error::RACE GUARD TRIGGERED: Live manifest on release changed after switch plan started! "
+            "Refusing to upload new manifest to prevent overwriting concurrent updates.",
+            file=sys.stderr,
+        )
+        return False
+
+    print("RACE GUARD PASSED: Live manifest is byte-identical to baseline copy from plan start.")
+    return True
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", required=True, choices=["koyal", "indicconformer"], help="Switch target")
     parser.add_argument("--current-dir", required=True, type=Path, help="Directory containing current manifest files")
     parser.add_argument("--plan-manifest", required=True, type=Path, help="Path to built manifest.json from plan")
-    parser.add_argument("--expected-sha256", type=str, default=None, help="Expected SHA-256 of plan manifest")
+    parser.add_argument("--expected-sha256", required=True, type=str, help="Expected SHA-256 of plan manifest (required and non-empty)")
     parser.add_argument("--draft-dir", type=Path, default=Path("draft_assets"), help="Directory containing draft assets")
     parser.add_argument("--release", type=str, default="models-2026-10", help="Release tag")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     print("=================================================================")
     print("APPLYING TELEGRAPHED MODEL SWITCH (LIVE UPDATE)")
     print("=================================================================")
 
     # 1. Plan hand-off verification: check that exact manifest built in plan is used
+    if not args.expected_sha256 or not args.expected_sha256.strip():
+        print("::error::--expected-sha256 is required and cannot be empty. Refusing to run.", file=sys.stderr)
+        return 1
+
     if not args.plan_manifest.is_file():
         print(f"::error::Plan manifest artifact not found: {args.plan_manifest}", file=sys.stderr)
         return 1
@@ -128,17 +171,16 @@ def main():
     manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
     print(f"Plan artifact manifest SHA-256: {manifest_sha}")
 
-    if args.expected_sha256:
-        expected = args.expected_sha256.strip().lower()
-        if manifest_sha != expected:
-            print(
-                f"::error::Plan -> apply hand-off SHA-256 mismatch! "
-                f"Plan printed {expected}, but downloaded artifact has {manifest_sha}. "
-                f"Refusing to continue.",
-                file=sys.stderr,
-            )
-            return 1
-        print(f"SUCCESS: Plan hand-off SHA-256 verified ({manifest_sha}). Apply will not rebuild.")
+    expected = args.expected_sha256.strip().lower()
+    if manifest_sha != expected:
+        print(
+            f"::error::Plan -> apply hand-off SHA-256 mismatch! "
+            f"Plan printed {expected}, but downloaded artifact has {manifest_sha}. "
+            f"Refusing to continue.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"SUCCESS: Plan hand-off SHA-256 verified ({manifest_sha}). Apply will not rebuild.")
 
     # Check companion .sha256 file if present
     companion_sha_file = args.plan_manifest.parent / f"{args.plan_manifest.name}.sha256"
@@ -274,7 +316,13 @@ def main():
                 return 1
             print(f"Verified {aname} SHA-256 match: {h}")
 
-    # 7. Upload timestamped previous manifest (Fix 5: never clobber old ones)
+    # 7. Race guard: immediately before uploading the new manifest, download live manifest.json
+    # again and require it to be byte-identical to current_rel; otherwise stop without uploading.
+    print("Checking live manifest for concurrent modifications (race guard)...")
+    if not check_live_manifest_race(args.release, args.current_dir):
+        return 1
+
+    # 8. Upload timestamped previous manifest (Fix 5: never clobber old ones)
     utc_now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     prev_manifest_name = f"manifest-previous-{utc_now}.json"
     prev_sig_name = f"manifest-previous-{utc_now}.json.sig"
@@ -290,11 +338,11 @@ def main():
     print(f"Uploading immutable previous manifest history: {prev_manifest_name} and {prev_sig_name} (no clobber)...")
     upload_with_retry(args.release, [ts_manifest, ts_sig], clobber=False)
 
-    # 8. Upload new manifest.json.sig and manifest.json (updating live active release)
+    # 9. Upload new manifest.json.sig and manifest.json (updating live active release)
     print("Uploading active manifest.json.sig and manifest.json to live release...")
     upload_with_retry(args.release, [sig_file, args.plan_manifest], clobber=True)
 
-    # 9. Exact post-upload after-check: download and verify byte-for-byte equality & signature
+    # 10. Exact post-upload after-check: download and verify byte-for-byte equality & signature
     print("Performing exact post-upload after-check from live release...")
     post_dir = Path("post_verify")
     post_dir.mkdir(parents=True, exist_ok=True)

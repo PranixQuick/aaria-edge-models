@@ -1,5 +1,7 @@
 # Remote Telugu Model Switch (QuietKeep Models Repo)
 
+<!-- Note: sign-manifest.yml should not be run at the same time as te-switch.yml (they share the models-manifest release target). -->
+
 ## Overview
 
 QuietKeep edge devices running Aaria Edge download their speech recognition models and pre-rendered replies from a pinned, cryptographically signed release list:
@@ -40,6 +42,19 @@ The switch workflow is manual-only (`workflow_dispatch`) with two inputs:
 - `target`: `koyal` or `indicconformer` (required)
 - `dry_run`: boolean, **default `true`**
 
+### Concurrency Protection
+
+`te-switch.yml` defines top-level concurrency:
+```yaml
+concurrency:
+  group: models-manifest
+  cancel-in-progress: false
+```
+This guarantees that no two switch runs execute concurrently or interleave manifest modifications.
+
+> [!NOTE]
+> Workflow `sign-manifest.yml` targets the same release manifest (`models-2026-10`) and should not be run at the same time as `te-switch.yml`.
+
 ### Two-Job Permissions Architecture
 
 To protect production release assets and secrets, the workflow is split into two distinct jobs:
@@ -49,10 +64,12 @@ To protect production release assets and secrets, the workflow is split into two
    - Restricted to read-only permissions (`permissions: contents: read`).
    - Has **zero access** to repository signing secrets (`AARIA_MODELS_SIGNING_KEY` is never provided).
    - Downloads current manifest, verifies current signature, downloads Koyal draft files, builds the proposed manifest, enforces all SyncManifest limits, prints the unified diff, and uploads plan artifacts.
+   - Computes plan manifest SHA-256 and outputs `manifest_sha256` to `$GITHUB_OUTPUT`.
 
 2. **`apply` job**:
    - Strictly gated to `if: inputs.dry_run == false`.
    - Requires explicit elevation (`permissions: contents: write`) and accesses `AARIA_MODELS_SIGNING_KEY`.
+   - Enforces `--expected-sha256` as **REQUIRED and non-empty** from the plan output. Apply NEVER rebuilds the manifest.
    - Never runs during dry runs.
 
 ---
@@ -61,17 +78,24 @@ To protect production release assets and secrets, the workflow is split into two
 
 When `dry_run: false`, the `apply` job executes a fail-safe, atomic sequence:
 
-1. **No-op Detection**: If `models.te` in the proposed manifest equals the current release manifest, the workflow prints `No change - nothing to do` and exits cleanly with code 0 without touching any assets or re-signing anything.
+1. **Plan Hash & No-op Verification**:
+   - Requires `--expected-sha256` to be provided and match the downloaded plan artifact.
+   - If `models.te` in the proposed manifest equals the current release manifest, the workflow prints `No change - nothing to do` and exits cleanly with code 0 without touching any assets or re-signing anything.
 2. **Local Signing & Verification**: The new manifest is signed locally with ECDSA P-256, and immediately verified against the release public key (`manifest_public_key.b64`). **Nothing touches the live release before this local signature check passes.**
 3. **Exact Asset Upload & SHA Verification**: Exactly four Koyal files (`te-koyal__model.int8.onnx`, `te-koyal__tokens.txt`, `te-koyal__model.json`, `te-koyal__LICENSE-koyal-te-120m.txt`) are uploaded with 3-attempt exponential retries. They are immediately re-downloaded from the release and their SHA-256 checksums verified against the new manifest.
-4. **Audit Backup**: Current `manifest.json` and `.sig` are archived as `manifest-previous.json` and `manifest-previous.json.sig` on the release.
-5. **Manifest Atomic Update**: New `manifest.json.sig` and `manifest.json` are uploaded together (--clobber) with retries.
-6. **Exact After-Check**: The workflow downloads `manifest.json` and `manifest.json.sig` from the public release URL and requires **exact byte-for-byte equality** with the locally signed manifest and signature, plus a passing cryptographic verification.
+4. **Live-Manifest Race Guard**:
+   - Immediately before uploading the new manifest, `apply_switch.py` re-downloads the live `manifest.json` from the release.
+   - It asserts that the live manifest is **byte-identical** to the baseline copy the plan started from (`current_rel/manifest.json`).
+   - If any concurrent modification occurred, it aborts immediately with a clear error without uploading the new manifest.
+5. **Audit Backup**: Current `manifest.json` and `.sig` are archived as `manifest-previous-<UTC timestamp>.json` and `manifest-previous-<UTC timestamp>.json.sig` on the release (no clobber).
+6. **Manifest Atomic Update**: New `manifest.json.sig` and `manifest.json` are uploaded together (--clobber) with retries.
+7. **Exact After-Check**: The workflow downloads `manifest.json` and `manifest.json.sig` from the public release URL and requires **exact byte-for-byte equality** with the locally signed manifest and signature, plus a passing cryptographic verification.
 
 ### Automatic Rollback on Failure
-If any failure occurs during the live apply step (network disruption, upload failure, or verification mismatch), the final step triggers automatically (`if: failure() && inputs.dry_run == false`):
-- Re-uploads the saved previous `manifest.json` and `manifest.json.sig` using retries.
-- Re-downloads and cryptographically verifies the restored signature.
+If any failure occurs during the live apply step (network disruption, upload failure, or verification mismatch), the final step triggers automatically (`if: (failure() || cancelled()) && steps.apply_switch.outcome != 'skipped'`):
+- First inspects the live release manifest: if the live manifest already matches the saved previous bytes, it skips re-uploading entirely and prints `Live manifest unchanged - nothing to roll back`.
+- If rollback is needed, re-uploads the saved previous `manifest.json` and `manifest.json.sig` using retries.
+- Re-downloads and cryptographically verifies the restored signature against `manifest_public_key.b64`. **If the public key is missing, rollback strictly fails.**
 - Logs clearly: `ROLLED BACK to previous manifest`.
 
 ---

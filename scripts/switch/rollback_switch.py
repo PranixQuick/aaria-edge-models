@@ -6,7 +6,9 @@ Restores the saved previous manifest.json and manifest.json.sig from current-dir
 then downloads them from the release and requires:
 1. Byte-for-byte equality of downloaded manifest with saved previous copy.
 2. Byte-for-byte equality of downloaded signature with saved previous copy.
-3. Cryptographically valid signature against release public key.
+3. Cryptographically valid signature against release public key. If public key is missing, FAILS.
+4. If live manifest already matches saved previous bytes, skips re-upload entirely
+   and prints "Live manifest unchanged - nothing to roll back".
 """
 
 import argparse
@@ -46,11 +48,34 @@ def verify_signature(manifest_bytes: bytes, sig_bytes: bytes, pubkey_b64: str) -
     pub_key.verify(sig_bytes, manifest_bytes, ec.ECDSA(hashes.SHA256()))
 
 
-def main():
+def check_live_manifest_matches_saved(release: str, saved_manifest_bytes: bytes, check_dir: Path = None) -> bool:
+    """
+    Download live manifest.json from release and check if it already equals saved_manifest_bytes.
+    Returns True if identical, False if mismatch or download failed.
+    """
+    if check_dir is None:
+        check_dir = Path("rollback_pre_check")
+    check_dir.mkdir(parents=True, exist_ok=True)
+    dl = subprocess.run(
+        ["gh", "release", "download", release, "-p", "manifest.json", "-D", str(check_dir), "--clobber"],
+        capture_output=True,
+        text=True,
+    )
+    if dl.returncode != 0:
+        return False
+
+    live_manifest_path = check_dir / "manifest.json"
+    if not live_manifest_path.is_file():
+        return False
+
+    return live_manifest_path.read_bytes() == saved_manifest_bytes
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--current-dir", required=True, type=Path, help="Directory containing saved previous manifest files")
     parser.add_argument("--release", type=str, default="models-2026-10", help="Release tag")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     print("=================================================================")
     print("EXECUTING AUTOMATIC ROLLBACK TO PREVIOUS MANIFEST")
@@ -60,6 +85,7 @@ def main():
     saved_sig_path = args.current_dir / "manifest.json.sig"
     pubkey_path = args.current_dir / "manifest_public_key.b64"
 
+    # 1. Require saved previous manifest, signature, AND release public key
     if not saved_manifest_path.is_file() or not saved_sig_path.is_file():
         print(
             f"::error::Cannot rollback: saved previous manifest files not found in {args.current_dir}. "
@@ -68,8 +94,22 @@ def main():
         )
         return 1
 
+    if not pubkey_path.is_file():
+        print(
+            f"::error::Cannot rollback: release public key file not found: {pubkey_path}. "
+            f"Strict verification requires public key to be present.",
+            file=sys.stderr,
+        )
+        return 1
+
     saved_manifest_bytes = saved_manifest_path.read_bytes()
     saved_sig_bytes = saved_sig_path.read_bytes()
+
+    # 2. Skip re-upload entirely when live manifest already equals saved previous bytes
+    print("Checking live release manifest before rollback...")
+    if check_live_manifest_matches_saved(args.release, saved_manifest_bytes):
+        print("Live manifest unchanged - nothing to roll back")
+        return 0
 
     print(f"Re-uploading previous manifest.json and manifest.json.sig to {args.release}...")
     try:
@@ -111,17 +151,14 @@ def main():
 
     print("SUCCESS: Restored manifest.json and manifest.json.sig are byte-for-byte identical to saved previous files.")
 
-    # Cryptographic verification
-    if pubkey_path.is_file():
-        pubkey_b64 = pubkey_path.read_text(encoding="utf-8")
-        try:
-            verify_signature(restored_manifest_bytes, restored_sig_bytes, pubkey_b64)
-            print("SUCCESS: Rollback manifest signature verified with release public key.")
-        except Exception as e:
-            print(f"::error::Rollback signature verification failed: {e}", file=sys.stderr)
-            return 1
-    else:
-        print(f"::warning::Public key {pubkey_path} not found; byte equality verified but signature check skipped.")
+    # Cryptographic verification: public key file must exist and signature must verify
+    pubkey_b64 = pubkey_path.read_text(encoding="utf-8")
+    try:
+        verify_signature(restored_manifest_bytes, restored_sig_bytes, pubkey_b64)
+        print("SUCCESS: Rollback manifest signature verified with release public key.")
+    except Exception as e:
+        print(f"::error::Rollback signature verification failed: {e}", file=sys.stderr)
+        return 1
 
     print("=================================================================")
     print("ROLLED BACK to previous manifest successfully.")

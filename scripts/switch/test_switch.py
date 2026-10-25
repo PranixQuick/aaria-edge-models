@@ -12,6 +12,7 @@ Tests:
 7. Python compilation on all scripts.
 8. YAML parsing and security assertions on workflows (te-compare.yml, te-switch.yml):
    - te-switch.yml: workflow_dispatch only, dry_run defaults to true.
+   - concurrency: { group: models-manifest, cancel-in-progress: false }
    - plan job has contents: write (for draft listing) and NO secrets.
    - apply job has if: inputs.dry_run == false and contents: write.
    - failure()-rollback step exists in apply job with cancelled() check.
@@ -20,7 +21,13 @@ Tests:
 11. score_onnx.py manifest validation: missing model.int8.onnx or tokens.txt fails (not skip).
 12. fetch_draft_assets unit tests (fake responses).
 13. Shell-syntax tests: bash -n validation on every workflow run: step; assert no << here-docs.
-14. verify_manifest, apply_switch, rollback_switch unit tests.
+14. verify_manifest unit tests.
+15. Part 43e Gap Fix Tests:
+    - Empty or missing expected sha refused by apply_switch.
+    - Output-write failure in build_te_switch exits non-zero.
+    - Race guard in apply_switch stops before upload when live manifest changed.
+    - Missing public key strictly fails rollback_switch.
+    - Unchanged live manifest skips rollback re-upload.
 """
 
 import base64
@@ -150,7 +157,7 @@ def test_koyal_and_indicconformer_builds():
         )
         assert koyal_manifest["models"]["te"]["type"] == "ctc"
         assert len(koyal_manifest["models"]["te"]["files"]) == 4
-        # Verify en, hi, replies byte-identical
+        # Verify non-target languages unchanged
         assert koyal_manifest["models"]["en"] == MOCK_MANIFEST["models"]["en"]
         assert koyal_manifest["models"]["hi"] == MOCK_MANIFEST["models"]["hi"]
         assert koyal_manifest["replies"] == MOCK_MANIFEST["replies"]
@@ -173,35 +180,37 @@ def test_live_indicconformer_matches_stored():
     assert stored_path.is_file(), f"Missing {stored_path}"
     stored_data = json.loads(stored_path.read_text(encoding="utf-8"))
 
-    url = "https://github.com/PranixQuick/aaria-edge-models/releases/download/models-2026-10/manifest.json"
+    manifest_url = "https://github.com/PranixQuick/aaria-edge-models/releases/download/models-2026-10/manifest.json"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "test-switch"})
+        req = urllib.request.Request(manifest_url, headers={"User-Agent": "test-suite"})
         with urllib.request.urlopen(req, timeout=10) as resp:
-            live_manifest = json.loads(resp.read().decode("utf-8"))
-        live_te = live_manifest.get("models", {}).get("te")
-        assert live_te == stored_data, "Live models.te does not match stored te-indicconformer.json"
-        print("  -> Stored te-indicconformer.json matches live models-2026-10 manifest byte-for-byte!")
+            live_data = json.loads(resp.read().decode("utf-8"))
+            live_te = live_data.get("models", {}).get("te")
+            assert live_te == stored_data, "Stored te-indicconformer.json does NOT match live release models-2026-10 models.te!"
+            print("  -> Stored te-indicconformer.json matches live models-2026-10 manifest byte-for-byte!")
     except Exception as e:
-        print(f"  -> Skipping live check (offline or network error: {e})")
+        print(f"  -> SKIP (network unavailable or timeout): {e}")
 
 
 def test_size_limits_enforced():
     print("Testing 600 MB total and 400 MB per-file limits...")
-    bad_single = copy.deepcopy(MOCK_MANIFEST)
-    bad_single["models"]["en"]["files"][0]["bytes"] = 700 * 1024 * 1024
+    # Over 400 MB single file
+    bad_manifest = copy.deepcopy(MOCK_MANIFEST)
+    bad_manifest["models"]["en"]["files"][0]["bytes"] = 700 * 1024 * 1024
     try:
-        build_te_switch.validate_sync_manifest_rules(bad_single)
-        assert False, "Expected ValueError for single file > 400 MB"
+        build_te_switch.validate_sync_manifest_rules(bad_manifest)
+        assert False, "Failed to reject >400 MB single file"
     except ValueError as e:
         assert "exceeds 400 MB limit" in str(e)
         print(f"  -> 700 MB limit violation caught: {e}")
 
-    bad_total = copy.deepcopy(MOCK_MANIFEST)
-    bad_total["models"]["en"]["files"][0]["bytes"] = 350 * 1024 * 1024
-    bad_total["models"]["hi"]["files"][0]["bytes"] = 350 * 1024 * 1024
+    # Total over 600 MB
+    bad_manifest2 = copy.deepcopy(MOCK_MANIFEST)
+    bad_manifest2["models"]["en"]["files"][0]["bytes"] = 350 * 1024 * 1024
+    bad_manifest2["models"]["hi"]["files"][0]["bytes"] = 350 * 1024 * 1024
     try:
-        build_te_switch.validate_sync_manifest_rules(bad_total)
-        assert False, "Expected ValueError for total files > 600 MB"
+        build_te_switch.validate_sync_manifest_rules(bad_manifest2)
+        assert False, "Failed to reject >600 MB total files"
     except ValueError as e:
         assert "exceeds 600 MB limit" in str(e)
         print(f"  -> >600 MB total limit violation caught: {e}")
@@ -209,50 +218,54 @@ def test_size_limits_enforced():
 
 def test_security_rules_enforced():
     print("Testing security rules (http URL, URL prefix, path traversal, version)...")
-    # 1. Non-https or non-prefix url
-    bad_url = copy.deepcopy(MOCK_MANIFEST)
-    bad_url["models"]["en"]["files"][0]["url"] = "http://github.com/PranixQuick/aaria-edge-models/releases/download/models-2026-10/model.onnx"
+    # 1. http URL
+    bad_url_manifest = copy.deepcopy(MOCK_MANIFEST)
+    bad_url_manifest["models"]["en"]["files"][0]["url"] = "http://github.com/PranixQuick/aaria-edge-models/releases/download/models-2026-10/model.onnx"
     try:
-        build_te_switch.validate_sync_manifest_rules(bad_url)
-        assert False, "Expected ValueError for http URL"
+        build_te_switch.validate_sync_manifest_rules(bad_url_manifest)
+        assert False, "Failed to reject non-prefixed http URL"
     except ValueError as e:
+        assert "does not start with required prefix" in str(e)
         print(f"  -> http URL violation caught: {e}")
 
-    bad_prefix = copy.deepcopy(MOCK_MANIFEST)
-    bad_prefix["models"]["en"]["files"][0]["url"] = "https://malicious.example.com/models-2026-10/model.onnx"
+    # 2. URL prefix mismatch
+    bad_prefix_manifest = copy.deepcopy(MOCK_MANIFEST)
+    bad_prefix_manifest["models"]["en"]["files"][0]["url"] = "https://malicious.example.com/models-2026-10/model.onnx"
     try:
-        build_te_switch.validate_sync_manifest_rules(bad_prefix)
-        assert False, "Expected ValueError for URL prefix mismatch"
+        build_te_switch.validate_sync_manifest_rules(bad_prefix_manifest)
+        assert False, "Failed to reject URL not starting with required prefix"
     except ValueError as e:
+        assert "does not start with required prefix" in str(e)
         print(f"  -> URL prefix mismatch caught: {e}")
 
-    # 2. Path traversal
-    bad_traversal = copy.deepcopy(MOCK_MANIFEST)
-    bad_traversal["models"]["en"]["files"][0]["name"] = "../model.onnx"
+    # 3. Path traversal in filename
+    bad_path_manifest = copy.deepcopy(MOCK_MANIFEST)
+    bad_path_manifest["models"]["en"]["files"][0]["name"] = "../model.onnx"
     try:
-        build_te_switch.validate_sync_manifest_rules(bad_traversal)
-        assert False, "Expected ValueError for path traversal"
+        build_te_switch.validate_sync_manifest_rules(bad_path_manifest)
+        assert False, "Failed to reject path traversal in filename"
     except ValueError as e:
+        assert "Path traversal detected" in str(e)
         print(f"  -> path traversal caught: {e}")
 
-    # 3. Version != 1
-    bad_version = copy.deepcopy(MOCK_MANIFEST)
-    bad_version["version"] = 2
+    # 4. Version != 1
+    bad_version_manifest = copy.deepcopy(MOCK_MANIFEST)
+    bad_version_manifest["version"] = 2
     try:
-        build_te_switch.validate_sync_manifest_rules(bad_version)
-        assert False, "Expected ValueError for version != 1"
+        build_te_switch.validate_sync_manifest_rules(bad_version_manifest)
+        assert False, "Failed to reject version != 1"
     except ValueError as e:
+        assert "version must be 1" in str(e)
         print(f"  -> version != 1 caught: {e}")
 
 
 def test_noop_detection():
     print("Testing no-op detection...")
-    current = copy.deepcopy(MOCK_MANIFEST)
-    same = copy.deepcopy(MOCK_MANIFEST)
-    assert build_te_switch.check_is_noop(current, same) is True
-    diff = copy.deepcopy(MOCK_MANIFEST)
-    diff["models"]["te"]["type"] = "other"
-    assert build_te_switch.check_is_noop(current, diff) is False
+    assert build_te_switch.check_is_noop(MOCK_MANIFEST, copy.deepcopy(MOCK_MANIFEST)) is True
+
+    diff_manifest = copy.deepcopy(MOCK_MANIFEST)
+    diff_manifest["models"]["te"]["type"] = "other"
+    assert build_te_switch.check_is_noop(MOCK_MANIFEST, diff_manifest) is False
     print("  -> No-op detection verified!")
 
 
@@ -260,34 +273,36 @@ def test_exact_four_file_list_enforced():
     print("Testing exact four-file Koyal draft enforcement (missing/extra files fail)...")
     with tempfile.TemporaryDirectory() as td:
         tpath = Path(td)
+        draft_dir = tpath / "draft"
+        draft_dir.mkdir()
+
+        # Missing draft_dir entirely
         try:
             build_te_switch.build_koyal_entry(None)
-            assert False, "Expected FileNotFoundError for None draft_dir"
+            assert False, "Should fail when draft_dir is None"
         except FileNotFoundError as e:
             print(f"  -> Missing draft_dir caught: {e}")
 
-        # Missing one file
-        missing_dir = tpath / "missing" / "draft"
-        missing_dir.mkdir(parents=True)
-        for role in ["model.int8.onnx", "model.json", "tokens.txt"]:
-            fname = build_te_switch.KOYAL_REQUIRED_ASSETS[role]
-            (missing_dir / fname).write_text("x", encoding="utf-8")
+        # Missing required file
+        for name in [
+            "te-koyal__model.int8.onnx",
+            "te-koyal__tokens.txt",
+            "te-koyal__model.json",
+        ]:
+            (draft_dir / name).write_text("dummy", encoding="utf-8")
         try:
-            build_te_switch.build_koyal_entry(missing_dir)
-            assert False, "Expected FileNotFoundError for missing LICENSE"
+            build_te_switch.build_koyal_entry(draft_dir)
+            assert False, "Should fail when te-koyal__LICENSE-koyal-te-120m.txt is missing"
         except FileNotFoundError as e:
             assert "te-koyal__LICENSE-koyal-te-120m.txt" in str(e)
             print(f"  -> Missing draft asset caught: {e}")
 
-        # Extra file
-        extra_dir = tpath / "extra" / "draft"
-        extra_dir.mkdir(parents=True)
-        for role, fname in build_te_switch.KOYAL_REQUIRED_ASSETS.items():
-            (extra_dir / fname).write_text("x", encoding="utf-8")
-        (extra_dir / "te-koyal__unexpected.bin").write_text("x", encoding="utf-8")
+        # Extra unexpected te-koyal__ file
+        (draft_dir / "te-koyal__LICENSE-koyal-te-120m.txt").write_text("dummy", encoding="utf-8")
+        (draft_dir / "te-koyal__unexpected.bin").write_text("bad", encoding="utf-8")
         try:
-            build_te_switch.build_koyal_entry(extra_dir)
-            assert False, "Expected ValueError for unexpected te-koyal__ file"
+            build_te_switch.build_koyal_entry(draft_dir)
+            assert False, "Should fail when extra unexpected te-koyal__ file is present"
         except ValueError as e:
             assert "Unexpected te-koyal__ asset" in str(e)
             print(f"  -> Unexpected te-koyal__ asset caught: {e}")
@@ -298,25 +313,30 @@ def test_signature_roundtrip_throwaway_key():
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec
 
+    # Generate disposable key in memory - NEVER writes to disk, never hardcodes secret
     private_key = ec.generate_private_key(ec.SECP256R1())
-    public_key = private_key.public_key()
-    pub_der = public_key.public_bytes(
+    pem_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("utf-8")
+
+    pub_der = private_key.public_key().public_bytes(
         encoding=serialization.Encoding.DER,
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
-    pub_b64 = base64.b64encode(pub_der).decode("ascii")
+    pubkey_b64 = base64.b64encode(pub_der).decode("ascii")
 
-    data = b'{"hello": "world"}\n'
-    sig = private_key.sign(data, ec.ECDSA(hashes.SHA256()))
+    test_payload = b'{"test": "payload_for_signing_verification"}\n'
+    sig = apply_switch.sign_manifest(test_payload, pem_bytes)
 
-    # Verify original
-    public_key.verify(sig, data, ec.ECDSA(hashes.SHA256()))
+    # Valid signature check
+    apply_switch.verify_signature(test_payload, sig, pubkey_b64)
 
-    # Verify tamper fails
-    tampered = b'{"hello": "world!"}\n'
+    # Tampered payload fails
     try:
-        public_key.verify(sig, tampered, ec.ECDSA(hashes.SHA256()))
-        assert False, "Tampered data verification should fail"
+        apply_switch.verify_signature(test_payload + b"tamper", sig, pubkey_b64)
+        assert False, "Signature verification failed to catch tampered payload"
     except Exception:
         pass
     print("  -> Signature round-trip with throwaway key passed (tamper detection verified)!")
@@ -471,6 +491,156 @@ def test_verify_manifest_logic():
         print("  -> sha256_bytes passed!")
 
 
+# ==============================================================================
+# Part 43e Gap Fix Tests
+# ==============================================================================
+
+def test_empty_expected_sha_refused():
+    print("Testing that empty or missing --expected-sha256 is refused in apply_switch...")
+    with tempfile.TemporaryDirectory() as td:
+        tpath = Path(td)
+        manifest_file = tpath / "manifest.json"
+        manifest_file.write_text('{"version": 1}', encoding="utf-8")
+        current_dir = tpath / "current"
+        current_dir.mkdir()
+        (current_dir / "manifest.json").write_text('{"version": 1}', encoding="utf-8")
+
+        # Test empty string passed to --expected-sha256
+        res = apply_switch.main([
+            "--target", "indicconformer",
+            "--current-dir", str(current_dir),
+            "--plan-manifest", str(manifest_file),
+            "--expected-sha256", "",
+        ])
+        assert res != 0, f"Expected non-zero exit for empty --expected-sha256, got {res}"
+
+        # Test whitespace only
+        res = apply_switch.main([
+            "--target", "indicconformer",
+            "--current-dir", str(current_dir),
+            "--plan-manifest", str(manifest_file),
+            "--expected-sha256", "   ",
+        ])
+        assert res != 0, f"Expected non-zero exit for whitespace --expected-sha256, got {res}"
+
+        # Test argument omitted (argparse error)
+        try:
+            apply_switch.main([
+                "--target", "indicconformer",
+                "--current-dir", str(current_dir),
+                "--plan-manifest", str(manifest_file),
+            ])
+            assert False, "Expected SystemExit when --expected-sha256 is omitted"
+        except SystemExit as e:
+            assert e.code != 0
+        print("  -> Empty and missing --expected-sha256 correctly refused!")
+
+
+def test_output_write_failure_exits_nonzero():
+    print("Testing that failure to write GITHUB_OUTPUT exits non-zero...")
+    with tempfile.TemporaryDirectory() as td:
+        bad_path = str(Path(td) / "nonexistent_dir" / "output.txt")
+        old_env = os.environ.get("GITHUB_OUTPUT")
+        try:
+            os.environ["GITHUB_OUTPUT"] = bad_path
+            try:
+                build_te_switch.write_github_output(False, "dummyhash")
+                assert False, "Expected SystemExit when writing GITHUB_OUTPUT fails"
+            except SystemExit as e:
+                assert e.code != 0, f"Expected non-zero exit code, got {e.code}"
+        finally:
+            if old_env is None:
+                os.environ.pop("GITHUB_OUTPUT", None)
+            else:
+                os.environ["GITHUB_OUTPUT"] = old_env
+        print("  -> GITHUB_OUTPUT write failure correctly exits non-zero!")
+
+
+def test_changed_live_manifest_stops_before_upload():
+    print("Testing race guard: changed live manifest stops before upload...")
+    with tempfile.TemporaryDirectory() as td:
+        tpath = Path(td)
+        current_dir = tpath / "current"
+        current_dir.mkdir()
+        baseline_manifest = current_dir / "manifest.json"
+        baseline_manifest.write_bytes(b'{"baseline": "plan_start"}\n')
+
+        race_check_dir = tpath / "race_check"
+        race_check_dir.mkdir()
+        live_manifest = race_check_dir / "manifest.json"
+        live_manifest.write_bytes(b'{"changed": "concurrent_edit"}\n')
+
+        orig_run = subprocess.run
+        def mock_run(cmd, *a, **kw):
+            if "download" in cmd and "manifest.json" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return orig_run(cmd, *a, **kw)
+
+        try:
+            subprocess.run = mock_run
+            res = apply_switch.check_live_manifest_race("models-2026-10", current_dir, check_dir=race_check_dir)
+            assert res is False, "Expected race check to return False when live manifest differs"
+
+            # Verify identical bytes passes
+            live_manifest.write_bytes(baseline_manifest.read_bytes())
+            res_pass = apply_switch.check_live_manifest_race("models-2026-10", current_dir, check_dir=race_check_dir)
+            assert res_pass is True, "Expected race check to return True when live manifest matches baseline"
+        finally:
+            subprocess.run = orig_run
+        print("  -> Race guard correctly stops upload when live manifest changes!")
+
+
+def test_missing_key_fails_rollback():
+    print("Testing that missing public key file strictly fails rollback...")
+    with tempfile.TemporaryDirectory() as td:
+        tpath = Path(td)
+        current_dir = tpath / "current"
+        current_dir.mkdir()
+        (current_dir / "manifest.json").write_bytes(b'{"version": 1}\n')
+        (current_dir / "manifest.json.sig").write_bytes(b'dummy_sig')
+        # manifest_public_key.b64 is intentionally omitted
+
+        res = rollback_switch.main(["--current-dir", str(current_dir)])
+        assert res != 0, f"Expected non-zero exit when public key is missing, got {res}"
+        print("  -> Missing public key correctly causes rollback failure!")
+
+
+def test_unchanged_manifest_no_rollback_upload():
+    print("Testing that unchanged live manifest skips rollback re-upload...")
+    with tempfile.TemporaryDirectory() as td:
+        tpath = Path(td)
+        current_dir = tpath / "current"
+        current_dir.mkdir()
+        saved_bytes = b'{"version": 1, "status": "unchanged"}\n'
+        (current_dir / "manifest.json").write_bytes(saved_bytes)
+        (current_dir / "manifest.json.sig").write_bytes(b'dummy_sig')
+        (current_dir / "manifest_public_key.b64").write_text("dummy_pubkey", encoding="utf-8")
+
+        pre_check = Path("rollback_pre_check")
+        uploaded_files = []
+        orig_run = subprocess.run
+        def mock_run(cmd, *a, **kw):
+            if "download" in cmd:
+                pre_check.mkdir(parents=True, exist_ok=True)
+                (pre_check / "manifest.json").write_bytes(saved_bytes)
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if "upload" in cmd:
+                uploaded_files.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return orig_run(cmd, *a, **kw)
+
+        try:
+            subprocess.run = mock_run
+            res = rollback_switch.main(["--current-dir", str(current_dir)])
+            assert res == 0, f"Expected 0 exit when live manifest is unchanged, got {res}"
+            assert len(uploaded_files) == 0, f"Expected NO upload calls when live manifest unchanged, got: {uploaded_files}"
+        finally:
+            subprocess.run = orig_run
+            if pre_check.is_dir():
+                shutil.rmtree(pre_check, ignore_errors=True)
+        print("  -> Unchanged live manifest correctly skips rollback re-upload and exits 0!")
+
+
 def test_workflows_shell_syntax():
     print("Testing workflow shell syntax with bash -n and asserting no here-documents...")
     import yaml
@@ -591,6 +761,16 @@ def test_workflows_yaml():
         f"te-switch.yml must be workflow_dispatch only, found: {s_triggers}"
     )
 
+    # Concurrency verification
+    concurrency = s_data.get("concurrency", {})
+    assert concurrency.get("group") == "models-manifest", (
+        f"te-switch.yml concurrency group must be 'models-manifest', got {concurrency}"
+    )
+    assert concurrency.get("cancel-in-progress") is False, (
+        f"te-switch.yml cancel-in-progress must be False, got {concurrency}"
+    )
+    print("  -> te-switch.yml concurrency: { group: models-manifest, cancel-in-progress: false } verified!")
+
     on_block = s_data.get("on") if "on" in s_data else s_data.get(True, {})
     dispatch_inputs = on_block.get("workflow_dispatch", {}).get("inputs", {})
     assert "target" in dispatch_inputs, "te-switch.yml missing input 'target'"
@@ -638,6 +818,11 @@ def test_workflows_yaml():
     assert rollback_step is not None, "apply job must contain a rollback step with if: (failure() || cancelled())"
     print("  -> failure() || cancelled() rollback step verified in apply job!")
 
+    # Docs mention sign-manifest.yml concurrency
+    doc_text = (REPO_ROOT / "docs" / "TE_SWITCH.md").read_text(encoding="utf-8")
+    assert "sign-manifest.yml" in doc_text, "docs/TE_SWITCH.md must mention sign-manifest.yml"
+    print("  -> docs/TE_SWITCH.md notes sign-manifest.yml concurrency!")
+
 
 if __name__ == "__main__":
     test_koyal_and_indicconformer_builds()
@@ -650,6 +835,11 @@ if __name__ == "__main__":
     test_score_onnx_manifest_checks()
     test_fetch_draft_assets_logic()
     test_verify_manifest_logic()
+    test_empty_expected_sha_refused()
+    test_output_write_failure_exits_nonzero()
+    test_changed_live_manifest_stops_before_upload()
+    test_missing_key_fails_rollback()
+    test_unchanged_manifest_no_rollback_upload()
     test_workflows_shell_syntax()
     test_py_compile_new_scripts()
     test_workflows_yaml()

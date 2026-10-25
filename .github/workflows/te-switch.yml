@@ -4,6 +4,10 @@ name: te-switch
 # Updates models.te in signed manifest.json with ECDSA P-256 signature.
 # Manual dispatch only. Defaults to dry_run: true.
 
+concurrency:
+  group: models-manifest
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:
